@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(cloud_sim_server VERSION 0.3.0 LANGUAGES CXX)
+project(cloud_sim_server VERSION 0.4.0 LANGUAGES CXX)
 
 add_executable(cloud_sim_server
     src/main.cpp
@@ -33,6 +33,14 @@ if(BUILD_TESTING)
             COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/test_send_interactor.py
         )
         add_test(
+            NAME sky_state_python_test
+            COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/test_receive_sky.py
+        )
+        add_test(
+            NAME sky_control_python_test
+            COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/test_send_sky_control.py
+        )
+        add_test(
             NAME cloud_protocol_loopback_test
             COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/test_protocol_loopback.py
                     --server $<TARGET_FILE:cloud_sim_server>
@@ -42,9 +50,21 @@ if(BUILD_TESTING)
             COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/test_control_loopback.py
                     --server $<TARGET_FILE:cloud_sim_server>
         )
+        add_test(
+            NAME sky_protocol_loopback_test
+            COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/test_sky_loopback.py
+                    --server $<TARGET_FILE:cloud_sim_server>
+        )
+        add_test(
+            NAME sky_regression_loopback_test
+            COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/test_sky_regression_loopback.py
+                    --server $<TARGET_FILE:cloud_sim_server>
+        )
         set_tests_properties(
             cloud_protocol_loopback_test
             cloud_control_loopback_test
+            sky_protocol_loopback_test
+            sky_regression_loopback_test
             PROPERTIES TIMEOUT 12
         )
     endif()

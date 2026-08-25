@@ -34,6 +34,72 @@ struct SimulationVector {
   float z = 0.0f;
 };
 
+struct CloudWindLevel {
+  float normalized_height = 0.0f;
+  SimulationVector velocity_cells_per_second{};
+};
+
+enum class CloudForcingLayerKind : std::uint8_t {
+  Stratiform = 1,
+  Convective = 2,
+  Cirrus = 3,
+  Fog = 4,
+};
+
+struct CloudForcingLayer {
+  CloudForcingLayerKind kind = CloudForcingLayerKind::Stratiform;
+  float normalized_base = 0.0f;
+  float normalized_top = 1.0f;
+  float coverage = 0.0f;
+  float optical_depth = 0.0f;
+  float convective_activity = 0.0f;
+};
+
+struct CloudForcing {
+  bool enabled = false;
+
+  // The profile is sampled linearly by normalized grid height. Keeping the
+  // heights explicit lets a weather model concentrate shear near a boundary
+  // layer without making CloudSimulation aware of world-space units.
+  std::array<CloudWindLevel, 4> wind_profile{{
+      {0.0f, {0.55f, 0.0f, 0.0f}},
+      {0.25f, {0.7125f, 0.15f, 0.0f}},
+      {0.70f, {1.005f, -0.1427f, 0.0f}},
+      {1.0f, {1.20f, 0.0f, 0.0f}},
+  }};
+  float wind_response_per_second = 0.18f;
+
+  // Cloud layers are clipped to the simulated vertical domain and kept
+  // contiguous. They make the fluid density agree with the SKS1 layer
+  // metadata instead of injecting every cloud near the ground.
+  std::array<CloudForcingLayer, 4> cloud_layers{};
+  std::uint8_t cloud_layer_count = 0;
+
+  float thermal_source_multiplier = 1.0f;
+  float vapor_source_multiplier = 1.0f;
+  // Vertical acceleration is stored in grid cells/s^2. The environment
+  // converts its physical m/s^2 targets once, using the active domain and
+  // grid height, so changing resolution does not change the weather scale.
+  float updraft_acceleration_cells_per_second_squared = 1.0f;
+  float buoyancy_acceleration_cells_per_second_squared = 1.0f;
+
+  float surface_temperature_target = 0.0f;
+  float top_temperature_target = 0.0f;
+  float temperature_target_response_per_second = 0.0f;
+  float surface_vapor_target = 0.0f;
+  float top_vapor_target = 0.0f;
+  float vapor_target_response_per_second = 0.0f;
+
+  float lapse_cooling_per_second = 0.035f;
+  float condensation_per_second = 5.0f;
+  float evaporation_per_second = 1.4f;
+  float cloud_decay_per_second = 0.004f;
+  float vapor_decay_per_second = 0.001f;
+  float temperature_decay_per_second = 0.055f;
+  float precipitation_per_second = 0.0f;
+  float precipitation_threshold = 0.65f;
+};
+
 struct SimulationQuaternion {
   float x = 0.0f;
   float y = 0.0f;
@@ -104,6 +170,15 @@ public:
     return interaction_stats_;
   }
 
+  const CloudForcing &environmentalForcing() const {
+    return environmental_forcing_;
+  }
+
+  void setEnvironmentalForcing(const CloudForcing &forcing) {
+    validateEnvironmentalForcing(forcing);
+    environmental_forcing_ = forcing;
+  }
+
   void setInteractors(std::vector<CloudInteractor> interactors) {
     if (interactors.size() > 64U) {
       throw std::invalid_argument("At most 64 cloud interactors are supported");
@@ -159,6 +234,17 @@ public:
     interaction_stats_ = {};
     interaction_cell_budget_ = 0;
     time_ = 0.0f;
+    constexpr std::array<float, 4> source_x_fractions{
+        0.31f, 0.67f, 0.17f, 0.82f};
+    constexpr std::array<float, 4> source_y_fractions{
+        0.23f, 0.74f, 0.61f, 0.38f};
+    for (std::size_t index = 0; index < layer_source_x_cells_.size();
+         ++index) {
+      layer_source_x_cells_[index] =
+          source_x_fractions[index] * static_cast<float>(n_);
+      layer_source_y_cells_[index] =
+          source_y_fractions[index] * static_cast<float>(n_);
+    }
   }
 
   void step(float dt) {
@@ -328,6 +414,26 @@ public:
     return stats;
   }
 
+  float densityCenterOfMassNormalizedHeight() const {
+    double weighted_height = 0.0;
+    double total_mass = 0.0;
+    for (int z = 0; z < n_; ++z) {
+      const double normalized_height =
+          static_cast<double>(z) / static_cast<double>(n_ - 1);
+      for (int y = 0; y < n_; ++y) {
+        for (int x = 0; x < n_; ++x) {
+          const double mass =
+              std::max(0.0, static_cast<double>(cloud_[index(x, y, z)]));
+          weighted_height += normalized_height * mass;
+          total_mass += mass;
+        }
+      }
+    }
+    return total_mass > 1.0e-12
+               ? static_cast<float>(weighted_height / total_mass)
+               : -1.0f;
+  }
+
   bool allFinite() const {
     return finiteField(u_) && finiteField(v_) && finiteField(w_) &&
            finiteField(temperature_) && finiteField(vapor_) &&
@@ -371,6 +477,139 @@ private:
   static float wrapUnit(float value) {
     value -= std::floor(value);
     return value < 0.0f ? value + 1.0f : value;
+  }
+
+  static void validateEnvironmentalForcing(const CloudForcing &forcing) {
+    if (!forcing.enabled) {
+      return;
+    }
+
+    float previous_height = -1.0f;
+    for (const CloudWindLevel &level : forcing.wind_profile) {
+      if (!std::isfinite(level.normalized_height) ||
+          level.normalized_height < 0.0f || level.normalized_height > 1.0f ||
+          level.normalized_height <= previous_height ||
+          !std::isfinite(level.velocity_cells_per_second.x) ||
+          !std::isfinite(level.velocity_cells_per_second.y) ||
+          !std::isfinite(level.velocity_cells_per_second.z)) {
+        throw std::invalid_argument(
+            "Cloud forcing wind levels must be finite, ordered, and in [0, 1]");
+      }
+      previous_height = level.normalized_height;
+    }
+
+    if (forcing.cloud_layer_count > forcing.cloud_layers.size()) {
+      throw std::invalid_argument("Cloud forcing supports at most four layers");
+    }
+    for (std::size_t index = 0; index < forcing.cloud_layer_count; ++index) {
+      const CloudForcingLayer &layer = forcing.cloud_layers[index];
+      const auto kind = static_cast<std::uint8_t>(layer.kind);
+      if (kind < static_cast<std::uint8_t>(
+                     CloudForcingLayerKind::Stratiform) ||
+          kind > static_cast<std::uint8_t>(CloudForcingLayerKind::Fog) ||
+          !std::isfinite(layer.normalized_base) ||
+          !std::isfinite(layer.normalized_top) ||
+          !std::isfinite(layer.coverage) ||
+          !std::isfinite(layer.optical_depth) ||
+          !std::isfinite(layer.convective_activity) ||
+          layer.normalized_base < 0.0f ||
+          layer.normalized_top <= layer.normalized_base ||
+          layer.normalized_top > 1.0f || layer.coverage < 0.0f ||
+          layer.coverage > 1.0f || layer.optical_depth < 0.0f ||
+          layer.optical_depth > 500.0f ||
+          layer.convective_activity < 0.0f ||
+          layer.convective_activity > 1.0f) {
+        throw std::invalid_argument(
+            "Cloud forcing layers must have valid kind, height, and strength");
+      }
+    }
+
+    if (!std::isfinite(forcing.surface_temperature_target) ||
+        !std::isfinite(forcing.top_temperature_target)) {
+      throw std::invalid_argument(
+          "Cloud forcing temperature targets must be finite");
+    }
+
+    const std::array<float, 17> nonnegative_values{{
+        forcing.wind_response_per_second,
+        forcing.thermal_source_multiplier,
+        forcing.vapor_source_multiplier,
+        forcing.updraft_acceleration_cells_per_second_squared,
+        forcing.buoyancy_acceleration_cells_per_second_squared,
+        forcing.temperature_target_response_per_second,
+        forcing.surface_vapor_target,
+        forcing.top_vapor_target,
+        forcing.vapor_target_response_per_second,
+        forcing.lapse_cooling_per_second,
+        forcing.condensation_per_second,
+        forcing.evaporation_per_second,
+        forcing.cloud_decay_per_second,
+        forcing.vapor_decay_per_second,
+        forcing.temperature_decay_per_second,
+        forcing.precipitation_per_second,
+        forcing.precipitation_threshold,
+    }};
+    for (const float value : nonnegative_values) {
+      if (!std::isfinite(value) || value < 0.0f) {
+        throw std::invalid_argument(
+            "Cloud forcing rates, multipliers, and vapor values must be finite and non-negative");
+      }
+    }
+  }
+
+  static SimulationVector sampleWindProfile(const CloudForcing &forcing,
+                                            float normalized_height) {
+    const auto &profile = forcing.wind_profile;
+    if (normalized_height <= profile.front().normalized_height) {
+      return profile.front().velocity_cells_per_second;
+    }
+    for (std::size_t i = 1; i < profile.size(); ++i) {
+      if (normalized_height <= profile[i].normalized_height) {
+        const CloudWindLevel &lower = profile[i - 1U];
+        const CloudWindLevel &upper = profile[i];
+        const float span = upper.normalized_height - lower.normalized_height;
+        const float alpha =
+            (normalized_height - lower.normalized_height) / span;
+        return {
+            lower.velocity_cells_per_second.x +
+                (upper.velocity_cells_per_second.x -
+                 lower.velocity_cells_per_second.x) *
+                    alpha,
+            lower.velocity_cells_per_second.y +
+                (upper.velocity_cells_per_second.y -
+                 lower.velocity_cells_per_second.y) *
+                    alpha,
+            lower.velocity_cells_per_second.z +
+                (upper.velocity_cells_per_second.z -
+                 lower.velocity_cells_per_second.z) *
+                    alpha,
+        };
+      }
+    }
+    return profile.back().velocity_cells_per_second;
+  }
+
+  static float smoothUnit(float value) {
+    value = std::clamp(value, 0.0f, 1.0f);
+    return value * value * (3.0f - 2.0f * value);
+  }
+
+  static float layerSupportAtHeight(const CloudForcing &forcing,
+                                    float normalized_height,
+                                    float minimum_feather) {
+    float support = 0.0f;
+    for (std::size_t index = 0; index < forcing.cloud_layer_count; ++index) {
+      const CloudForcingLayer &layer = forcing.cloud_layers[index];
+      const float feather = minimum_feather;
+      const float lower = smoothUnit(
+          (normalized_height - (layer.normalized_base - feather)) / feather);
+      const float upper = smoothUnit(
+          ((layer.normalized_top + feather) - normalized_height) / feather);
+      const float coverage_support =
+          std::sqrt(std::clamp(layer.coverage, 0.0f, 1.0f));
+      support = std::max(support, lower * upper * coverage_support);
+    }
+    return std::clamp(support, 0.0f, 1.0f);
   }
 
   static SimulationVector add(SimulationVector a, SimulationVector b) {
@@ -701,6 +940,11 @@ private:
     return value < 0 ? value + n_ : value;
   }
 
+  float wrapHorizontalCoordinate(float value) const {
+    value = std::fmod(value, static_cast<float>(n_));
+    return value < 0.0f ? value + static_cast<float>(n_) : value;
+  }
+
   int clampVertical(int value) const { return std::clamp(value, 0, n_ - 1); }
 
   std::size_t index(int x, int y, int z) const {
@@ -997,51 +1241,207 @@ private:
   }
 
   void injectThermal(float dt) {
-    const float cx = static_cast<float>(n_) *
-                     static_cast<float>(0.50 + 0.08 * std::sin(time_ * 0.19));
-    const float cy = static_cast<float>(n_) *
-                     static_cast<float>(0.50 + 0.06 * std::cos(time_ * 0.17));
-    const float cz = static_cast<float>(n_) * 0.10f;
-    const float radius = std::max(2.0f, static_cast<float>(n_) * 0.10f);
-    const float inverse_radius_squared = 1.0f / (radius * radius);
-
-    const int min_x = static_cast<int>(std::floor(cx - radius));
-    const int max_x = static_cast<int>(std::ceil(cx + radius));
-    const int min_y = static_cast<int>(std::floor(cy - radius));
-    const int max_y = static_cast<int>(std::ceil(cy + radius));
-    const int min_z =
-        std::max(1, static_cast<int>(std::floor(cz - radius * 0.6f)));
-    const int max_z =
-        std::min(n_ - 2, static_cast<int>(std::ceil(cz + radius * 0.6f)));
-
-    for (int z = min_z; z <= max_z; ++z) {
-      for (int y = min_y; y <= max_y; ++y) {
-        for (int x = min_x; x <= max_x; ++x) {
-          const float dx = static_cast<float>(x) - cx;
-          const float dy = static_cast<float>(y) - cy;
-          const float dz = (static_cast<float>(z) - cz) * 1.5f;
-          const float r2 =
-              (dx * dx + dy * dy + dz * dz) * inverse_radius_squared;
-          if (r2 > 1.0f) {
-            continue;
+    if (!environmental_forcing_.enabled) {
+      const float cx = static_cast<float>(n_) * static_cast<float>(
+                                                  0.50 + 0.08 *
+                                                             std::sin(
+                                                                 time_ *
+                                                                 0.19));
+      const float cy = static_cast<float>(n_) * static_cast<float>(
+                                                  0.50 + 0.06 *
+                                                             std::cos(
+                                                                 time_ *
+                                                                 0.17));
+      const float cz = static_cast<float>(n_) * 0.10f;
+      const float radius =
+          std::max(2.0f, static_cast<float>(n_) * 0.10f);
+      const float inverse_radius_squared = 1.0f / (radius * radius);
+      const int min_x = static_cast<int>(std::floor(cx - radius));
+      const int max_x = static_cast<int>(std::ceil(cx + radius));
+      const int min_y = static_cast<int>(std::floor(cy - radius));
+      const int max_y = static_cast<int>(std::ceil(cy + radius));
+      const int min_z =
+          std::max(1, static_cast<int>(std::floor(cz - radius * 0.6f)));
+      const int max_z = std::min(
+          n_ - 2, static_cast<int>(std::ceil(cz + radius * 0.6f)));
+      for (int z = min_z; z <= max_z; ++z) {
+        for (int y = min_y; y <= max_y; ++y) {
+          for (int x = min_x; x <= max_x; ++x) {
+            const float dx = static_cast<float>(x) - cx;
+            const float dy = static_cast<float>(y) - cy;
+            const float dz = (static_cast<float>(z) - cz) * 1.5f;
+            const float r2 =
+                (dx * dx + dy * dy + dz * dz) * inverse_radius_squared;
+            if (r2 > 1.0f) {
+              continue;
+            }
+            const float weight = std::exp(-3.0f * r2) * (1.0f - r2);
+            const std::size_t i = index(x, y, z);
+            if (solid_mask_[i] != 0U) {
+              continue;
+            }
+            temperature_[i] += dt * 0.85f * weight;
+            vapor_[i] += dt * 2.2f * weight;
+            w_[i] += dt * 1.6f * weight;
           }
-          const float weight = std::exp(-3.0f * r2) * (1.0f - r2);
-          const std::size_t i = index(x, y, z);
-          if (solid_mask_[i] != 0U) {
-            continue;
+        }
+      }
+      return;
+    }
+
+    float total_layer_coverage = 0.0f;
+    for (std::size_t layer_index = 0;
+         layer_index < environmental_forcing_.cloud_layer_count;
+         ++layer_index) {
+      total_layer_coverage +=
+          environmental_forcing_.cloud_layers[layer_index].coverage;
+    }
+    const float source_normalization =
+        1.0f / std::sqrt(std::max(1.0f, total_layer_coverage));
+
+    for (std::size_t layer_index = 0;
+         layer_index < environmental_forcing_.cloud_layer_count;
+         ++layer_index) {
+      const CloudForcingLayer &layer =
+          environmental_forcing_.cloud_layers[layer_index];
+      float center_fraction = 0.35f;
+      float thermal_factor = 0.25f;
+      float vapor_factor = 0.90f;
+      float updraft_factor = 0.15f;
+      float activity_factor = 1.0f;
+      switch (layer.kind) {
+      case CloudForcingLayerKind::Convective:
+        center_fraction = 0.16f;
+        activity_factor = 0.25f + 0.75f * layer.convective_activity;
+        thermal_factor = activity_factor;
+        vapor_factor = 1.0f;
+        updraft_factor = 0.10f + 0.90f * layer.convective_activity;
+        break;
+      case CloudForcingLayerKind::Cirrus:
+        center_fraction = 0.50f;
+        thermal_factor = 0.04f;
+        vapor_factor = 0.28f;
+        updraft_factor = 0.02f;
+        break;
+      case CloudForcingLayerKind::Fog:
+        center_fraction = 0.30f;
+        thermal_factor = 0.0f;
+        vapor_factor = 1.10f;
+        updraft_factor = 0.0f;
+        break;
+      case CloudForcingLayerKind::Stratiform:
+        break;
+      }
+      const float normalized_center =
+          layer.normalized_base +
+          (layer.normalized_top - layer.normalized_base) * center_fraction;
+      const SimulationVector source_wind =
+          sampleWindProfile(environmental_forcing_, normalized_center);
+      layer_source_x_cells_[layer_index] = wrapHorizontalCoordinate(
+          layer_source_x_cells_[layer_index] + source_wind.x * dt);
+      layer_source_y_cells_[layer_index] = wrapHorizontalCoordinate(
+          layer_source_y_cells_[layer_index] + source_wind.y * dt);
+      const float cx = layer_source_x_cells_[layer_index];
+      const float cy = layer_source_y_cells_[layer_index];
+      const float cz =
+          normalized_center * static_cast<float>(n_ - 1);
+      const float horizontal_radius = std::max(
+          2.0f, static_cast<float>(n_) *
+                    (0.055f + 0.070f * std::sqrt(layer.coverage)));
+      const float vertical_radius = std::clamp(
+          (layer.normalized_top - layer.normalized_base) *
+              static_cast<float>(n_ - 1) * 0.35f,
+          1.5f, static_cast<float>(n_) * 0.16f);
+      const float optical_strength =
+          1.0f - std::exp(-layer.optical_depth / 24.0f);
+      const float source_strength =
+          std::sqrt(layer.coverage) *
+          (0.45f + 1.05f * optical_strength) * source_normalization;
+      const float inverse_horizontal_radius_squared =
+          1.0f / (horizontal_radius * horizontal_radius);
+      const int min_x =
+          static_cast<int>(std::floor(cx - horizontal_radius));
+      const int max_x =
+          static_cast<int>(std::ceil(cx + horizontal_radius));
+      const int min_y =
+          static_cast<int>(std::floor(cy - horizontal_radius));
+      const int max_y =
+          static_cast<int>(std::ceil(cy + horizontal_radius));
+      const int min_z = std::max(
+          1, static_cast<int>(std::floor(cz - vertical_radius)));
+      const int max_z = std::min(
+          n_ - 2, static_cast<int>(std::ceil(cz + vertical_radius)));
+      for (int z = min_z; z <= max_z; ++z) {
+        for (int y = min_y; y <= max_y; ++y) {
+          for (int x = min_x; x <= max_x; ++x) {
+            const float dx = static_cast<float>(x) - cx;
+            const float dy = static_cast<float>(y) - cy;
+            const float dz = (static_cast<float>(z) - cz) *
+                             horizontal_radius / vertical_radius;
+            const float r2 = (dx * dx + dy * dy + dz * dz) *
+                             inverse_horizontal_radius_squared;
+            if (r2 > 1.0f) {
+              continue;
+            }
+            const float weight =
+                source_strength * std::exp(-3.0f * r2) * (1.0f - r2);
+            const std::size_t i = index(x, y, z);
+            if (solid_mask_[i] != 0U) {
+              continue;
+            }
+            temperature_[i] +=
+                dt * 0.85f * weight * thermal_factor *
+                environmental_forcing_.thermal_source_multiplier;
+            vapor_[i] += dt * 2.2f * weight * vapor_factor *
+                         environmental_forcing_.vapor_source_multiplier;
+            w_[i] +=
+                dt * weight * updraft_factor *
+                environmental_forcing_
+                    .updraft_acceleration_cells_per_second_squared;
           }
-          temperature_[i] += dt * 0.85f * weight;
-          vapor_[i] += dt * 2.2f * weight;
-          w_[i] += dt * 1.6f * weight;
         }
       }
     }
   }
 
   void applyForces(float dt) {
+    if (!environmental_forcing_.enabled) {
+      for (int z = 0; z < n_; ++z) {
+        const float normalized_height =
+            static_cast<float>(z) / static_cast<float>(n_ - 1);
+        for (int y = 0; y < n_; ++y) {
+          for (int x = 0; x < n_; ++x) {
+            const std::size_t i = index(x, y, z);
+            if (solid_mask_[i] != 0U) {
+              continue;
+            }
+            const float buoyancy = 1.15f * temperature_[i] +
+                                   0.22f * vapor_[i] - 0.10f * cloud_[i];
+            w_[i] += dt * buoyancy;
+
+            const float target_wind_x = 0.55f + 0.65f * normalized_height;
+            const float target_wind_y =
+                0.15f * std::sin(normalized_height * 6.28318f);
+            const float wind_response = 1.0f - std::exp(-0.18f * dt);
+            u_[i] += (target_wind_x - u_[i]) * wind_response;
+            v_[i] += (target_wind_y - v_[i]) * wind_response;
+          }
+        }
+      }
+      return;
+    }
+
+    const float wind_response =
+        1.0f -
+        std::exp(-environmental_forcing_.wind_response_per_second * dt);
     for (int z = 0; z < n_; ++z) {
       const float normalized_height =
           static_cast<float>(z) / static_cast<float>(n_ - 1);
+      const SimulationVector target_wind =
+          sampleWindProfile(environmental_forcing_, normalized_height);
+      const float layer_support = layerSupportAtHeight(
+          environmental_forcing_, normalized_height,
+          2.0f / static_cast<float>(n_ - 1));
       for (int y = 0; y < n_; ++y) {
         for (int x = 0; x < n_; ++x) {
           const std::size_t i = index(x, y, z);
@@ -1050,14 +1450,14 @@ private:
           }
           const float buoyancy =
               1.15f * temperature_[i] + 0.22f * vapor_[i] - 0.10f * cloud_[i];
-          w_[i] += dt * buoyancy;
+          w_[i] += dt * buoyancy *
+                   environmental_forcing_
+                       .buoyancy_acceleration_cells_per_second_squared;
 
-          const float target_wind_x = 0.55f + 0.65f * normalized_height;
-          const float target_wind_y =
-              0.15f * std::sin(normalized_height * 6.28318f);
-          const float wind_response = 1.0f - std::exp(-0.18f * dt);
-          u_[i] += (target_wind_x - u_[i]) * wind_response;
-          v_[i] += (target_wind_y - v_[i]) * wind_response;
+          u_[i] += (target_wind.x - u_[i]) * wind_response;
+          v_[i] += (target_wind.y - v_[i]) * wind_response;
+          w_[i] +=
+              (target_wind.z * layer_support - w_[i]) * wind_response;
         }
       }
     }
@@ -1545,22 +1945,115 @@ private:
   }
 
   void applyThermodynamics(float dt) {
-    const float condense_response = 1.0f - std::exp(-5.0f * dt);
-    const float evaporate_response = 1.0f - std::exp(-1.4f * dt);
-    const float cloud_decay = std::exp(-0.004f * dt);
-    const float vapor_decay = std::exp(-0.001f * dt);
-    const float temperature_decay = std::exp(-0.055f * dt);
+    if (!environmental_forcing_.enabled) {
+      const float condense_response = 1.0f - std::exp(-5.0f * dt);
+      const float evaporate_response = 1.0f - std::exp(-1.4f * dt);
+      const float cloud_decay = std::exp(-0.004f * dt);
+      const float vapor_decay = std::exp(-0.001f * dt);
+      const float temperature_decay = std::exp(-0.055f * dt);
+
+      for (int z = 0; z < n_; ++z) {
+        const float normalized_height =
+            static_cast<float>(z) / static_cast<float>(n_ - 1);
+        for (int y = 0; y < n_; ++y) {
+          for (int x = 0; x < n_; ++x) {
+            const std::size_t i = index(x, y, z);
+            if (solid_mask_[i] != 0U) {
+              continue;
+            }
+            temperature_[i] -= dt * 0.035f * normalized_height;
+            const float saturation =
+                std::clamp(0.20f + 0.25f * temperature_[i] -
+                               0.055f * normalized_height,
+                           0.06f, 0.75f);
+
+            if (vapor_[i] > saturation) {
+              const float amount =
+                  (vapor_[i] - saturation) * condense_response;
+              vapor_[i] -= amount;
+              cloud_[i] += amount;
+              temperature_[i] += amount * 0.10f;
+            } else if (cloud_[i] > 0.0f && vapor_[i] < saturation) {
+              const float amount =
+                  std::min(cloud_[i], (saturation - vapor_[i]) *
+                                                evaporate_response);
+              vapor_[i] += amount;
+              cloud_[i] -= amount;
+              temperature_[i] -= amount * 0.06f;
+            }
+
+            cloud_[i] = std::max(0.0f, cloud_[i] * cloud_decay);
+            vapor_[i] = std::max(0.0f, vapor_[i] * vapor_decay);
+            temperature_[i] = std::clamp(
+                temperature_[i] * temperature_decay, -1.0f, 3.0f);
+          }
+        }
+      }
+      return;
+    }
+
+    const float vapor_decay =
+        std::exp(-environmental_forcing_.vapor_decay_per_second * dt);
+    const float temperature_decay =
+        std::exp(-environmental_forcing_.temperature_decay_per_second * dt);
+    const float temperature_target_response =
+        1.0f - std::exp(
+                   -environmental_forcing_
+                        .temperature_target_response_per_second *
+                   dt);
+    const float vapor_target_response =
+        1.0f - std::exp(
+                   -environmental_forcing_.vapor_target_response_per_second *
+                   dt);
+    const float precipitation_response =
+        1.0f -
+        std::exp(-environmental_forcing_.precipitation_per_second * dt);
 
     for (int z = 0; z < n_; ++z) {
       const float normalized_height =
           static_cast<float>(z) / static_cast<float>(n_ - 1);
+      const float layer_support = layerSupportAtHeight(
+          environmental_forcing_, normalized_height,
+          2.0f / static_cast<float>(n_ - 1));
+      const float condense_response =
+          1.0f - std::exp(
+                     -environmental_forcing_.condensation_per_second *
+                     (0.10f + 0.90f * layer_support) * dt);
+      const float evaporate_response =
+          1.0f - std::exp(
+                     -environmental_forcing_.evaporation_per_second *
+                     (1.25f - 0.35f * layer_support) * dt);
+      const float cloud_decay = std::exp(
+          -(environmental_forcing_.cloud_decay_per_second +
+            0.12f * (1.0f - layer_support)) *
+          dt);
       for (int y = 0; y < n_; ++y) {
         for (int x = 0; x < n_; ++x) {
           const std::size_t i = index(x, y, z);
           if (solid_mask_[i] != 0U) {
             continue;
           }
-          temperature_[i] -= dt * 0.035f * normalized_height;
+          const float temperature_target =
+              environmental_forcing_.surface_temperature_target +
+              (environmental_forcing_.top_temperature_target -
+               environmental_forcing_.surface_temperature_target) *
+                  normalized_height;
+          const float background_vapor_target =
+              environmental_forcing_.surface_vapor_target +
+              (environmental_forcing_.top_vapor_target -
+               environmental_forcing_.surface_vapor_target) *
+                  normalized_height;
+          const float vapor_target =
+              background_vapor_target *
+                  (0.20f + 0.80f * layer_support) +
+              0.08f * layer_support;
+          temperature_[i] -= dt *
+                             environmental_forcing_.lapse_cooling_per_second *
+                             normalized_height;
+          temperature_[i] +=
+              (temperature_target - temperature_[i]) *
+              temperature_target_response;
+          vapor_[i] += (vapor_target - vapor_[i]) * vapor_target_response;
           const float saturation = std::clamp(0.20f + 0.25f * temperature_[i] -
                                                   0.055f * normalized_height,
                                               0.06f, 0.75f);
@@ -1577,6 +2070,11 @@ private:
             cloud_[i] -= amount;
             temperature_[i] -= amount * 0.06f;
           }
+
+          const float precipitable_cloud =
+              std::max(0.0f, cloud_[i] -
+                                 environmental_forcing_.precipitation_threshold);
+          cloud_[i] -= precipitable_cloud * precipitation_response;
 
           cloud_[i] = std::max(0.0f, cloud_[i] * cloud_decay);
           vapor_[i] = std::max(0.0f, vapor_[i] * vapor_decay);
@@ -1693,6 +2191,9 @@ private:
   std::vector<std::uint8_t> scalar_touched_mask_;
   std::vector<std::size_t> scalar_touched_indices_;
   std::vector<CloudInteractor> interactors_;
+  std::array<float, 4> layer_source_x_cells_{};
+  std::array<float, 4> layer_source_y_cells_{};
+  CloudForcing environmental_forcing_{};
   InteractionStats interaction_stats_;
   std::size_t interaction_cell_budget_ = 0;
   std::size_t interaction_round_robin_ = 0;

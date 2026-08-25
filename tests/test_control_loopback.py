@@ -57,6 +57,8 @@ def main():
             "--warmup-seconds", "0",
             "--seconds", "3.6",
             "--no-send",
+            "--no-sky",
+            "--no-sky-control",
             "--control-port", str(control_port),
             "--max-interactors", "1",
         ],

@@ -37,6 +37,8 @@ def main():
             "--warmup-seconds", "0",
             "--seconds", "1.2",
             "--no-control",
+            "--no-sky",
+            "--no-sky-control",
             "--host", "127.0.0.1",
             "--port", str(port),
         ],

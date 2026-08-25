@@ -396,6 +396,21 @@ public:
   std::uint64_t droppedPackets() const { return dropped_packets_; }
   std::uint64_t droppedFrames() const { return dropped_frames_; }
 
+  // Small, already-framed control-independent state protocols such as SKS1
+  // share the sender accounting but remain on their own UDP destination port.
+  // Keeping the maximum below the CLD2 payload size avoids IP fragmentation.
+  bool sendSingleDatagram(const std::uint8_t *data, std::size_t size) {
+    if (data == nullptr || size == 0U || size > kPayloadBytes) {
+      throw std::invalid_argument(
+          "Single UDP state datagram must contain 1..1200 bytes");
+    }
+    if (!sendPacket(data, size)) {
+      ++dropped_frames_;
+      return false;
+    }
+    return true;
+  }
+
   void sendDensityV1(const std::vector<std::uint8_t> &density, int grid_size,
                      std::uint32_t frame_id, float simulation_time) {
     if (density.empty() ||
