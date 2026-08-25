@@ -1,0 +1,13 @@
+# CMake build outputs
+/build/
+/build-*/
+/cmake-build-*/
+CMakeUserPresets.json
+
+# Generated simulation captures
+*.raw
+
+# Editor and operating-system files
+.DS_Store
+.idea/
+.vscode/
