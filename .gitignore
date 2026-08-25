@@ -4,8 +4,11 @@
 /cmake-build-*/
 CMakeUserPresets.json
 
-# Generated simulation captures
+# Generated simulation captures and Python caches
 *.raw
+received-frame/
+__pycache__/
+*.pyc
 
 # Editor and operating-system files
 .DS_Store
