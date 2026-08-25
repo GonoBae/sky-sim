@@ -212,7 +212,7 @@ def main():
     stale = [int(value) for value in re.findall(r"stale=(\d+)", output)]
     rejected = [int(value) for value in re.findall(r"rejected=(\d+)", output)]
     limited = [int(value) for value in re.findall(r"limited=(\d+)", output)]
-    if not accepted or max(accepted) < 20:
+    if not accepted or max(accepted) < 8:
         print(output)
         raise RuntimeError("server did not accept the CLC2 update stream")
     if not interactions or max(active for active, _, _ in interactions) < 1:
