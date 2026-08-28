@@ -1,27 +1,47 @@
-# Unreal 렌더링 가이드 (전용 all-sky renderer)
+# Unreal 렌더링 아키텍처와 로드맵
 
-이 서버는 Unreal 기본 `VolumetricCloud`에 값을 주입하는 구조가 아닙니다. 서버가 보내는
-macro density/velocity와 `SKS1` 하늘 상태를 GPU resource로 올리고, 하나의 전용 all-sky
-render pipeline이 대기·구름·해·달·별을 Scene Color에 합성해야 합니다. 지형과 물체의
-Scene Depth, shadow map, motion vector는 그대로 사용합니다. Unreal 기본
-`VolumetricCloud`는 비활성화하며, `SkyAtmosphere`는 첫 연결 단계의 선택적 backend일 뿐
-최종 custom atmosphere pass에는 필수가 아닙니다.
+이 문서는 현재 저장소에 포함된 Unreal Engine 5.6 기준 구현과 장기 목표인 전용 all-sky
+renderer를 구분합니다. 이 서버는 Unreal 기본 `VolumetricCloud`에 값을 주입하지 않습니다.
+현재는 `Heterogeneous Volume` backend를 사용하고, 장기적으로 서버의 macro
+density/velocity와 `SKS1`을 하나의 custom render pipeline에서 합성합니다.
 
-## Unreal에서 필요한 최소 구성
+| 기능 | 현재 포함 | 목표 |
+|---|:---:|:---:|
+| `CLD2` RLE/CRC/frame 조립과 density 3D texture upload | O | O |
+| `SKS1` 기반 태양·달·Sky Light·Sky Atmosphere·Weather Fog | O | O |
+| Play 없는 editor preview와 Details authoring | O | O |
+| Heterogeneous Volume material | O | 교체 가능 |
+| regional mask, coordinate warp, 이중 density de-tiling | O | O |
+| previous/current density와 velocity 기반 temporal 보간 | | O |
+| occupancy skip, custom RDG ray march와 cloud shadow | | O |
+| atmosphere LUT, 해·달 disk, 별과 depth-aware 합성 | | O |
+| 강수 입자, 번개 bolt, 젖음·적설 material feedback | | O |
 
-레벨에 사용자가 배치할 것은 원칙적으로 다음 하나면 충분합니다.
+실제 프로젝트 실행과 Details 사용법은
+[Unreal Editor 사용 가이드](unreal-editor-guide.md)를 먼저 참고하십시오. 아래에서 `[목표]`로
+표시한 절은 현재 완료 기능이 아니라 다음 구현 계약입니다.
 
-- `SkySimSystem` Actor 하나: simulation volume transform, 서버 주소, 품질 preset만 노출
+## 현재 Unreal에서 필요한 최소 구성
 
-플러그인 내부에서 이 Actor가 `CLD2`/`SKS1` 수신 component, `CLC2`/`SKC1` 송신 socket,
-3D texture 두 세트와 custom full-screen/volume render pass를 소유합니다. 논리적으로는 한
-시스템이지만 UDP 포트가 다르므로 내부 socket은 스트림별로 분리합니다.
+레벨에는 `SkySimSystem` Actor 하나를 배치합니다. 현재 Actor는 다음 항목을 노출하거나
+내부에서 생성합니다.
 
-구름과 상호작용할 Actor에는 analytic collision proxy를 보내는
-`SkySimInteractorComponent`만 붙입니다. Actor마다 voxel simulation이나 Niagara를 만들
-필요는 없습니다. 태양/달 Directional Light를 별도 Actor로 노출하고 싶다면
-`SkySimSystem`이 자동 생성·갱신하게 하고, 사용자가 매 레벨 수동으로 각도나 색을 맞추지
-않도록 합니다.
+- Network와 Editor Preview
+- Time and Location, Weather와 Advanced Weather
+- 최대 4개 Cloud Authoring slot
+- Rendering, Wide Cloud World와 Cloud Presentation
+- 태양·달·Sky Light, Sky Atmosphere와 Weather Fog
+- 연결, control ACK, volume과 server state 진단 정보
+
+Actor는 game/editor tick에서 `CLD2`와 `SKS1` 수신 socket, `SKC1` 송신/ACK queue, 최신
+density CPU buffer와 transient `PF_G16` texture를 소유합니다. 현재 Unreal 프로젝트에는
+`CLC2`를 보내는 `SkySimInteractorComponent`가 아직 없으며 서버 기능은
+`tools/send_interactor.py`로 검증합니다.
+
+내부 `HeterogeneousVolumeComponent`는 `/Game/SkySim/M_SkySimVolume`을 사용합니다. 이
+material은 20km reference density를 광역 영역에 연속 반복하되 regional clear-sky mask,
+weather-map coordinate warp와 비정수 scale/offset의 두 번째 live-density lookup으로 정확한
+반복을 숨깁니다. detail erosion은 낮은 비정수 tiling과 mip 2를 사용합니다.
 
 ## 서버와 Unreal의 책임
 
@@ -32,18 +52,18 @@ Scene Depth, shadow map, motion vector는 그대로 사용합니다. Unreal 기�
 | 응결·증발·부력과 큰 구름 형태 | O | |
 | 물체의 moving-solid 경계와 구름 질량 밀어내기 | O | |
 | 빠른 물체의 swept wake·난류·날개 끝 와류 | O | |
-| density/velocity 프레임 사이 물리적 이동 | O | O (화면 보간) |
-| 작은 billow와 wispy edge | | O |
-| 대기 LUT와 태양/달 disk, 별 catalog raster | | O |
-| 태양 투과, cloud phase, 다중 산란 근사 | | O |
-| 비·눈 입자, 안개 depth 합성, 번개 bolt/음향 | 상태/event | O |
-| 카메라별 ray march, depth 합성, temporal AA | | O |
+| density/velocity 프레임 사이 물리적 이동 | O | 목표: 화면 보간 |
+| 작은 billow와 wispy edge | | 현재 material erosion / 목표 전용 noise |
+| 대기 LUT와 태양/달 disk, 별 catalog raster | | 목표 |
+| 태양 투과, cloud phase, 다중 산란 근사 | | 현재 HV / 목표 custom pass |
+| 비·눈 입자, 안개 depth 합성, 번개 bolt/음향 | 상태/event | Fog만 현재, 나머지 목표 |
+| 카메라별 ray march, depth 합성, temporal AA | | 목표 |
 
 서버에서 카메라 종속 ray march까지 계산하면 카메라마다 큰 영상을 전송해야 하고 Scene
 Depth와 정확히 합성하기 어렵습니다. 카메라·조명에 따라 달라지는 마지막 렌더링 단계만
 Unreal GPU에 남기는 것이 설정과 대역폭을 모두 줄입니다.
 
-## 단일 수신 시스템과 GPU 업로드
+## [목표] 단일 수신 시스템과 GPU 업로드
 
 1. volume socket이 같은 `CLD2.frame_id`의 모든 `field_mask` field를 조립합니다.
 2. RLE을 풀고 field CRC32를 확인합니다.
@@ -67,7 +87,7 @@ resource를 직접 건드리지 말고, 완성된 CPU staging buffer의 소유�
 때문에 정확히 짝이 없는 것은 정상이며, 최신 완성 volume과 최신 유효 sky snapshot을 각각
 계속 사용합니다.
 
-## SKS1 상태 보간과 좌표
+## [목표] SKS1 상태 보간과 좌표
 
 서버의 하늘 상태 기본 전송률은 5 Hz입니다. 일반 scalar는 `previous/current` 사이에서 시간
 보간하고 `predicted_valid_time_seconds` 이후 장시간 extrapolation하지 않습니다. 다만 허용된
@@ -116,7 +136,7 @@ fade-in하고, 사라지는 층도 원래 고도에서 fade-out합니다. 서버
 
 정확한 packet offset, 단위, flag는 [SKS1 문서](sky-state-protocol.md)를 따릅니다.
 
-## 대기, 해, 달과 별
+## [목표] 대기, 해, 달과 별
 
 최종 렌더러는 `SKS1`의 Rayleigh/Mie/ozone RGB 계수, scale height, Mie anisotropy와 지면
 albedo로 transmittance 및 multi-scattering LUT를 갱신합니다. 계수가 조금 변할 때 매
@@ -143,7 +163,7 @@ Unreal `SkyAtmosphere`를 임시 backend로 쓰는 경우에도 레벨에서 수
 `SkySimSystem`이 `SKS1` 값을 component parameter로 변환합니다. 최종 전용 atmosphere
 compute pass를 붙이면 같은 상태 buffer를 그대로 사용하므로 서버 계약은 바뀌지 않습니다.
 
-### 하나의 render pipeline 순서
+### [목표] 하나의 render pipeline 순서
 
 Render Dependency Graph 기준으로는 여러 shader dispatch를 하나의 `SkySim` feature/pass
 안에서 다음 순서로 예약합니다.
@@ -159,22 +179,24 @@ Directional Light는 지형·물체 조명과 shadow용이며, 해와 달 원반
 그립니다. 이렇게 해야 사용자가 level마다 sky component를 조합하지 않아도 되고, 노출과
 대기 감쇠도 한 상태에서 일관되게 계산됩니다.
 
-## World 좌표에서 volume 좌표로 변환
+## 현재 World 좌표와 광역 density sampling
 
-ray의 world sample 위치 `Pworld`를 `SkySimVolume` local 좌표로 옮긴 뒤 `[0,1]^3`으로
-정규화합니다.
+Heterogeneous Volume의 world sample 위치를 object-local `[0,1]^3`으로 정규화합니다.
 
 ```text
 Plocal = inverse(VolumeTransform) * Pworld
 P01    = (Plocal + VolumeHalfSize) / (2 * VolumeHalfSize)
 ```
 
-`P01`이 volume 밖이면 density는 0입니다. 서버와 동일하게 X/Y를 반복시키고 싶을 때만
-`frac(P01.xy)`를 사용합니다. 월드 경계에서 구름이 반대편으로 나타나는 것이 싫다면
-Unreal 렌더러는 volume 밖을 0으로 처리하고, 추후 서버의 open-boundary 모드와 함께
-변경해야 합니다.
+현재 Wide Cloud World는 `P01.xy`에 자동 tile count를 곱해 20km reference density를
+연속적으로 wrap sampling합니다. X/Y texture address는 wrap이고 Z만 top/bottom
+half-texel 범위로 clamp합니다. 첫 좌표에는 weather-map position warp를 적용하고, 두 번째
+좌표에는 비정수 scale/offset을 적용한 뒤 regional map으로 두 density를 혼합합니다. 따라서
+120km 볼륨이 6×6의 정확한 복사본처럼 보이는 현상을 줄이면서 reference tile 경계의
+bilinear 연속성은 유지합니다. 향후 open-boundary/clipmap 방식으로 전환하면 이 반복 계약도
+함께 바뀌어야 합니다.
 
-## 프레임 사이 보간
+## [목표] 프레임 사이 보간
 
 서버가 10Hz, 화면이 60Hz여도 density를 단순 선형 혼합하면 형태가 녹아 보입니다. 먼저
 velocity로 두 프레임을 서로 향해 반-이류한 뒤 혼합합니다.
@@ -192,7 +214,7 @@ densityMacro = lerp(d0, d1, frameFraction)
 유지합니다. 새 frame이 올 때 temporal history weight를 잠시 낮추면 ghosting을 줄일 수
 있습니다.
 
-## TrueSky 계열 품질을 만드는 density 함수
+## [목표] 전용 renderer의 density 함수
 
 ray marcher가 사용할 최종 density는 서버 density를 그대로 확대하지 않고 다음처럼
 만듭니다.
@@ -213,7 +235,7 @@ density    = max(0, shaped - edgeNoise * ErosionStrength) * macro
 구름이 미끄러지지 않습니다. 서버 velocity를 noise 좌표와 temporal reprojection에도
 사용하면 비행기 후류의 작은 디테일이 큰 흐름을 따라갑니다.
 
-## Ray-march와 조명
+## [목표] Ray-march와 조명
 
 권장 시작 순서는 다음과 같습니다.
 
@@ -238,7 +260,7 @@ transmittance *= absorption
 upscale를 사용합니다. 완전 해상도에서 step 수만 줄이는 것보다 구름 경계 품질과 비용의
 균형이 좋습니다.
 
-## 강수, 안개와 번개
+## [목표] 강수, 안개와 번개
 
 현재 서버는 전체 강수 flux, rain/snow fraction, 시정, 지면 젖음, cloud layer별 강수와
 번개 event/flash를 `SKS1`으로 보냅니다. 이 버전에는 3D 강수 shaft나 번개 위치 field가
@@ -260,7 +282,7 @@ upscale를 사용합니다. 완전 해상도에서 step 수만 줄이는 것보�
 서버가 계산한 위치·branch seed를 추가해야 네트워크 client 간 완전히 같은 번개를 만들 수
 있습니다.
 
-## Temporal accumulation
+## [목표] Temporal accumulation
 
 구름은 step noise가 눈에 잘 띄므로 frame마다 blue-noise/jitter로 sample 위치를 바꾸고
 이전 결과를 재투영합니다.
@@ -270,7 +292,7 @@ upscale를 사용합니다. 완전 해상도에서 step 수만 줄이는 것보�
 - 빠른 비행기 주변은 velocity gradient가 크므로 history weight를 낮춥니다.
 - 평균 영역은 history 85~95%, silhouette와 새로 생긴 구름은 훨씬 낮게 시작합니다.
 
-## 시작 품질 프리셋
+## [목표] 시작 품질 프리셋
 
 | 항목 | 빠른 확인 | 권장 시작 | 고품질 캡처 |
 |---|---:|---:|---:|
@@ -287,14 +309,14 @@ density 변형부터 검증합니다. 그다음 curl detail, lighting, temporal 
 
 ## 현실성의 범위와 단계별 로드맵
 
-현재 서버가 구현한 부분은 서로 일관된 **전역 환경 상태 + 한 개 macro cloud domain**입니다.
-natural weather는 날짜·위치·seed에 따른 연속 절차 모델이지 수치예보가 아닙니다. 실제
-전선, 도시 열섬, 산악파, 해륙풍, 레이더 강수 세포가 공간을 통과하는 모델은 아직 없고,
-달 ephemeris도 렌더링용 근사입니다. 이 저장소에는 위에서 설명한 Unreal 플러그인 코드가
-아직 포함되어 있지 않으므로 문서의 `SkySimSystem`은 구현 계약입니다.
+현재 서버가 구현한 부분은 서로 일관된 **전역 환경 상태 + 한 개 macro cloud domain**이며,
+저장소의 `Unreal/uskysim`이 이를 보여주는 Heterogeneous Volume 기준 구현입니다. Natural
+weather는 날짜·위치·seed에 따른 연속 절차 모델이지 수치예보가 아닙니다. 실제 전선, 도시
+열섬, 산악파, 해륙풍, 레이더 강수 세포가 공간을 통과하는 모델은 아직 없고, 달
+ephemeris도 렌더링용 근사입니다.
 
-1. **연결 기준선**: `64³ CLD2 + 5 Hz SKS1`, 전용 cloud ray march, 태양/달 Directional
-   Light와 기존 SkyAtmosphere를 `SKS1`로 자동 구동
+1. **현재 연결 기준선**: `64³ CLD2 + 5 Hz SKS1`, Heterogeneous Volume, editor authoring,
+   태양/달 Directional Light와 SkyAtmosphere를 `SKS1`로 자동 구동
 2. **완전한 전용 하늘 pass**: atmosphere LUT, 해·달 disk, 별 catalog, cloud shadow와
    aerial perspective를 한 pipeline으로 통합
 3. **국지 효과**: 3D precipitation/icing field, 지표 fog volume, 번개 위치·branch seed,

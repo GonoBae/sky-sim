@@ -1034,6 +1034,23 @@ int runSelfTest() {
   transition_weather.advance(5.0, 1710936005.0, {37.5, 127.0, 50.0});
   const float midpoint_temperature =
       transition_weather.profile().weather.surface_temperature_kelvin;
+  const cloud::WeatherProfile fair_multilayer_profile =
+      cloud::weather_detail::fixedProfile(cloud::WeatherPreset::Cumulus);
+  const float fair_low_thickness =
+      fair_multilayer_profile.cloud_layers[0].top_altitude_m -
+      fair_multilayer_profile.cloud_layers[0].base_altitude_m;
+  const float fair_deep_thickness =
+      fair_multilayer_profile.cloud_layers[1].top_altitude_m -
+      fair_multilayer_profile.cloud_layers[1].base_altitude_m;
+  const bool multilayer_preset_variation_ok =
+      fair_multilayer_profile.cloud_layer_count == 3U &&
+      fair_multilayer_profile.cloud_layers[0].base_altitude_m !=
+          fair_multilayer_profile.cloud_layers[1].base_altitude_m &&
+      std::abs(fair_low_thickness - fair_deep_thickness) > 500.0f &&
+      fair_multilayer_profile.cloud_layers[1].kind ==
+          cloud::CloudLayerKind::Convective &&
+      fair_multilayer_profile.cloud_layers[2].kind ==
+          cloud::CloudLayerKind::Cirrus;
   const bool transition_midpoint_ok =
       transition_weather.profile().weather.transition_progress > 0.49f &&
       transition_weather.profile().weather.transition_progress < 0.51f &&
@@ -1095,8 +1112,8 @@ int runSelfTest() {
         if (layer.kind == cloud::CloudLayerKind::Fog) {
           natural_threshold_smoothing_ok =
               smoothed.weather.preset == cloud::WeatherPreset::Natural &&
-              layer.coverage > 0.0f && layer.coverage < 0.01f &&
-              layer.optical_depth > 0.0f && layer.optical_depth < 0.1f;
+              layer.coverage > 0.0f && layer.coverage < 0.025f &&
+              layer.optical_depth > 0.0f && layer.optical_depth < 0.5f;
           break;
         }
       }
@@ -1163,10 +1180,87 @@ int runSelfTest() {
                relaxation_target_temperature) /
       relaxation_denominator;
   const bool natural_relaxation_ok =
-      initial_relaxation_error > 1.0f && relaxation_ratio_4hz > 0.35f &&
-      relaxation_ratio_4hz < 0.39f && relaxation_ratio_20hz > 0.35f &&
-      relaxation_ratio_20hz < 0.39f &&
+      initial_relaxation_error > 1.0f && relaxation_ratio_4hz < 0.01f &&
+      relaxation_ratio_20hz < 0.01f &&
       std::abs(relaxation_ratio_4hz - relaxation_ratio_20hz) < 0.001f;
+
+  // Time-lapse weather must visibly follow accelerated or reverse calendar
+  // motion, remain caller-rate independent, and stay stable while paused.
+  auto accelerated_natural_ratio = [&](double target_time, int hz) {
+    cloud::WeatherDirector director(cloud::WeatherPreset::Natural, 2468U);
+    director.initialize(relaxation_source_time, relaxation_location);
+    const float initial_temperature =
+        director.profile().weather.surface_temperature_kelvin;
+    const float target_temperature =
+        cloud::weather_detail::naturalProfile(
+            target_time, relaxation_location, 2468U)
+            .weather.surface_temperature_kelvin;
+    const float initial_error =
+        std::max(1.0e-6f,
+                 std::abs(initial_temperature - target_temperature));
+    const double dt = 1.0 / static_cast<double>(hz);
+    for (int step = 0; step < 5 * hz; ++step) {
+      director.advance(dt, target_time, relaxation_location);
+    }
+    return std::abs(director.profile().weather.surface_temperature_kelvin -
+                    target_temperature) /
+           initial_error;
+  };
+  const float accelerated_ratio_4hz =
+      accelerated_natural_ratio(relaxation_target_time, 4);
+  const float accelerated_ratio_20hz =
+      accelerated_natural_ratio(relaxation_target_time, 20);
+  const float reverse_ratio_20hz = accelerated_natural_ratio(
+      relaxation_source_time - 120.0 * 86400.0, 20);
+  cloud::WeatherDirector accelerated_cloud_preview(
+      cloud::WeatherPreset::Natural, 2468U);
+  accelerated_cloud_preview.initialize(relaxation_source_time,
+                                       relaxation_location);
+  const cloud::WeatherProfile accelerated_cloud_initial =
+      accelerated_cloud_preview.profile();
+  for (int step = 0; step < 100; ++step) {
+    accelerated_cloud_preview.advance(0.05, relaxation_target_time,
+                                      relaxation_location);
+  }
+  const cloud::WeatherProfile &accelerated_cloud_final =
+      accelerated_cloud_preview.profile();
+  bool accelerated_cloud_fields_changed =
+      accelerated_cloud_initial.cloud_layer_count !=
+      accelerated_cloud_final.cloud_layer_count;
+  const std::size_t comparable_layer_count = std::min<std::size_t>(
+      accelerated_cloud_initial.cloud_layer_count,
+      accelerated_cloud_final.cloud_layer_count);
+  for (std::size_t index = 0; index < comparable_layer_count; ++index) {
+    const cloud::CloudLayerState &initial_layer =
+        accelerated_cloud_initial.cloud_layers[index];
+    const cloud::CloudLayerState &final_layer =
+        accelerated_cloud_final.cloud_layers[index];
+    accelerated_cloud_fields_changed =
+        accelerated_cloud_fields_changed ||
+        initial_layer.kind != final_layer.kind ||
+        std::abs(initial_layer.base_altitude_m -
+                 final_layer.base_altitude_m) > 1.0f ||
+        std::abs(initial_layer.top_altitude_m -
+                 final_layer.top_altitude_m) > 1.0f ||
+        std::abs(initial_layer.coverage - final_layer.coverage) > 0.001f;
+  }
+  cloud::WeatherDirector paused_natural(cloud::WeatherPreset::Natural,
+                                        2468U);
+  paused_natural.initialize(relaxation_source_time, relaxation_location);
+  const cloud::WeatherProfile paused_initial = paused_natural.profile();
+  for (int step = 0; step < 100; ++step) {
+    paused_natural.advance(0.05, relaxation_source_time,
+                           relaxation_location);
+  }
+  const bool accelerated_natural_time_ok =
+      accelerated_ratio_4hz < 0.20f && accelerated_ratio_20hz < 0.20f &&
+      std::abs(accelerated_ratio_4hz - accelerated_ratio_20hz) < 0.002f &&
+      reverse_ratio_20hz < 0.20f &&
+      accelerated_cloud_fields_changed &&
+      paused_natural.profile().weather.surface_temperature_kelvin ==
+          paused_initial.weather.surface_temperature_kelvin &&
+      paused_natural.profile().cloud_layer_count ==
+          paused_initial.cloud_layer_count;
   const cloud::GeoLocation accelerated_transition_location{37.5665, 126.978,
                                                            38.0};
   constexpr double accelerated_transition_start = 1736672400.0;
@@ -1198,7 +1292,7 @@ int runSelfTest() {
       accelerated_transition.profile().weather.preset ==
           cloud::WeatherPreset::Natural;
   const bool weather_ok =
-      transition_midpoint_ok &&
+      transition_midpoint_ok && multilayer_preset_variation_ok &&
       transition_weather.profile().weather.preset ==
           cloud::WeatherPreset::Storm &&
       natural_a.profile().weather.surface_temperature_kelvin ==
@@ -1207,7 +1301,7 @@ int runSelfTest() {
           natural_b.profile().weather.wind_m_s.east &&
       natural_fog_reachable && natural_threshold_smoothing_ok &&
       immediate_natural_release_ok && natural_relaxation_ok &&
-      accelerated_transition_ok;
+      accelerated_transition_ok && accelerated_natural_time_ok;
 
   cloud::SkyStatePacketContext sky_context;
   sky_context.volume_frame_id = 42U;
@@ -1452,6 +1546,123 @@ int runSelfTest() {
     forcing.vapor_target_response_per_second = 0.03f;
     return forcing;
   };
+  struct DensityPlaneDiagnostics {
+    float maximum_density = 0.0f;
+    float representative_active_fraction = 0.0f;
+    float representative_relative_deviation = 0.0f;
+    std::size_t active_plane_count = 0U;
+    std::size_t uniform_active_plane_count = 0U;
+  };
+  const auto analyze_density_planes = [](const cloud::QuantizedVolume &volume,
+                                         int minimum_z, int maximum_z,
+                                         float active_threshold) {
+    DensityPlaneDiagnostics diagnostics;
+    const int plane_voxels = volume.size_x * volume.size_y;
+    double representative_mean = -1.0;
+    minimum_z = std::clamp(minimum_z, 0, volume.size_z - 1);
+    maximum_z = std::clamp(maximum_z, minimum_z, volume.size_z - 1);
+    for (int z = minimum_z; z <= maximum_z; ++z) {
+      double sum = 0.0;
+      double squared_sum = 0.0;
+      std::size_t active_voxels = 0U;
+      float plane_maximum = 0.0f;
+      for (int offset = 0; offset < plane_voxels; ++offset) {
+        const std::size_t voxel =
+            static_cast<std::size_t>(z * plane_voxels + offset);
+        const std::size_t byte_offset = voxel * 2U;
+        const auto encoded = static_cast<std::uint16_t>(
+            static_cast<std::uint16_t>(volume.bytes[byte_offset]) |
+            static_cast<std::uint16_t>(
+                static_cast<std::uint16_t>(volume.bytes[byte_offset + 1U])
+                << 8U));
+        const float value =
+            static_cast<float>(encoded) /
+                static_cast<float>(UINT16_MAX) *
+                volume.value_scale +
+            volume.value_bias;
+        sum += value;
+        squared_sum += static_cast<double>(value) * value;
+        plane_maximum = std::max(plane_maximum, value);
+        if (value > active_threshold) {
+          ++active_voxels;
+        }
+      }
+      diagnostics.maximum_density =
+          std::max(diagnostics.maximum_density, plane_maximum);
+      const double mean = sum / static_cast<double>(plane_voxels);
+      const double variance = std::max(
+          0.0, squared_sum / static_cast<double>(plane_voxels) - mean * mean);
+      const float relative_deviation =
+          mean > 0.0 ? static_cast<float>(std::sqrt(variance) / mean) : 0.0f;
+      const float active_fraction =
+          static_cast<float>(active_voxels) /
+          static_cast<float>(plane_voxels);
+      if (plane_maximum > active_threshold) {
+        ++diagnostics.active_plane_count;
+        if (active_fraction > 0.98f && relative_deviation < 0.02f) {
+          ++diagnostics.uniform_active_plane_count;
+        }
+      }
+      if (mean > representative_mean) {
+        representative_mean = mean;
+        diagnostics.representative_active_fraction = active_fraction;
+        diagnostics.representative_relative_deviation = relative_deviation;
+      }
+    }
+    return diagnostics;
+  };
+
+  // A cloud layer describes where emitters may create condensate; metadata
+  // alone must never saturate every horizontal cell into a flat sheet.
+  cloud::CloudForcing plateau_forcing =
+      make_layer_forcing(0.25f, 0.55f);
+  plateau_forcing.cloud_layers[0] = {
+      cloud::CloudForcingLayerKind::Stratiform, 0.25f, 0.55f, 0.65f, 28.0f,
+      0.0f};
+  plateau_forcing.thermal_source_multiplier = 0.0f;
+  plateau_forcing.vapor_source_multiplier = 0.0f;
+  plateau_forcing.updraft_acceleration_cells_per_second_squared = 0.0f;
+  plateau_forcing.buoyancy_acceleration_cells_per_second_squared = 0.0f;
+  plateau_forcing.surface_temperature_target = 0.0f;
+  plateau_forcing.top_temperature_target = 0.0f;
+  plateau_forcing.temperature_target_response_per_second = 0.05f;
+  plateau_forcing.surface_vapor_target = 0.35f;
+  plateau_forcing.top_vapor_target = 0.35f;
+  plateau_forcing.vapor_target_response_per_second = 0.25f;
+  cloud::CloudSimulation plateau_simulation(24, 4);
+  plateau_simulation.setEnvironmentalForcing(plateau_forcing);
+  for (int step = 0; step < 80; ++step) {
+    plateau_simulation.step(0.05f);
+  }
+  const DensityPlaneDiagnostics plateau_diagnostics =
+      analyze_density_planes(plateau_simulation.densityVolume16(), 4, 15,
+                             0.001f);
+  const bool layer_metadata_plateau_free =
+      plateau_diagnostics.maximum_density < 0.0001f &&
+      plateau_diagnostics.active_plane_count == 0U &&
+      plateau_diagnostics.uniform_active_plane_count == 0U;
+
+  cloud::CloudForcing varied_emitter_forcing = plateau_forcing;
+  varied_emitter_forcing.thermal_source_multiplier = 0.20f;
+  varied_emitter_forcing.vapor_source_multiplier = 1.0f;
+  varied_emitter_forcing.updraft_acceleration_cells_per_second_squared =
+      0.35f;
+  varied_emitter_forcing.buoyancy_acceleration_cells_per_second_squared =
+      0.25f;
+  cloud::CloudSimulation varied_emitter_simulation(24, 4);
+  varied_emitter_simulation.setEnvironmentalForcing(varied_emitter_forcing);
+  for (int step = 0; step < 120; ++step) {
+    varied_emitter_simulation.step(0.05f);
+  }
+  const DensityPlaneDiagnostics varied_emitter_diagnostics =
+      analyze_density_planes(varied_emitter_simulation.densityVolume16(), 4,
+                             15, 0.01f);
+  const bool emitter_plane_variation_ok =
+      varied_emitter_diagnostics.maximum_density > 0.01f &&
+      varied_emitter_diagnostics.active_plane_count > 0U &&
+      varied_emitter_diagnostics.uniform_active_plane_count == 0U &&
+      varied_emitter_diagnostics.representative_active_fraction < 0.95f &&
+      varied_emitter_diagnostics.representative_relative_deviation > 0.10f;
   cloud::CloudSimulation low_layer_simulation(24, 4);
   cloud::CloudSimulation high_layer_simulation(24, 4);
   low_layer_simulation.setEnvironmentalForcing(
@@ -1466,6 +1677,40 @@ int runSelfTest() {
       low_layer_simulation.densityCenterOfMassNormalizedHeight();
   const float high_cloud_height =
       high_layer_simulation.densityCenterOfMassNormalizedHeight();
+
+  cloud::CloudForcing four_layer_forcing =
+      make_layer_forcing(0.02f, 0.14f);
+  four_layer_forcing.cloud_layer_count = 4U;
+  four_layer_forcing.cloud_layers[0] = {
+      cloud::CloudForcingLayerKind::Fog, 0.02f, 0.14f, 0.58f, 12.0f,
+      0.02f};
+  four_layer_forcing.cloud_layers[1] = {
+      cloud::CloudForcingLayerKind::Stratiform, 0.18f, 0.36f, 0.72f, 24.0f,
+      0.20f};
+  four_layer_forcing.cloud_layers[2] = {
+      cloud::CloudForcingLayerKind::Convective, 0.40f, 0.69f, 0.62f, 30.0f,
+      0.78f};
+  four_layer_forcing.cloud_layers[3] = {
+      cloud::CloudForcingLayerKind::Cirrus, 0.75f, 0.94f, 0.36f, 5.0f,
+      0.08f};
+  cloud::CloudSimulation four_layer_simulation(24, 4);
+  four_layer_simulation.setEnvironmentalForcing(four_layer_forcing);
+  for (int step = 0; step < 200; ++step) {
+    four_layer_simulation.step(0.05f);
+  }
+  const std::array<cloud::SimulationStats, 4> four_layer_stats{{
+      four_layer_simulation.densityStatsInNormalizedHeightRange(0.0f, 0.16f),
+      four_layer_simulation.densityStatsInNormalizedHeightRange(0.16f, 0.38f),
+      four_layer_simulation.densityStatsInNormalizedHeightRange(0.38f, 0.72f),
+      four_layer_simulation.densityStatsInNormalizedHeightRange(0.72f, 0.98f),
+  }};
+  const bool all_four_layers_forced =
+      four_layer_simulation.environmentalForcing().cloud_layer_count == 4U &&
+      four_layer_simulation.allFinite() &&
+      std::all_of(four_layer_stats.begin(), four_layer_stats.end(),
+                  [](const cloud::SimulationStats &layer_stats) {
+                    return layer_stats.maximum > 0.00001f;
+                  });
 
   const cloud::CloudForcing active_layer_forcing =
       make_layer_forcing(0.20f, 0.50f);
@@ -1490,6 +1735,23 @@ int runSelfTest() {
       std::abs(active_layer_stats.maximum - ghost_layer_stats.maximum) <
           1.0e-7f &&
       std::abs(active_layer_stats.mean - ghost_layer_stats.mean) < 1.0e-7f;
+
+  cloud::WeatherProfile disabled_slots_profile =
+      cloud::weather_detail::fixedProfile(cloud::WeatherPreset::Clear);
+  disabled_slots_profile.cloud_layers = {};
+  for (std::size_t index = 0; index < cloud::kMaximumCloudLayers; ++index) {
+    disabled_slots_profile.cloud_layers[index] = {
+        index == 1U ? cloud::CloudLayerKind::Cirrus
+                    : cloud::CloudLayerKind::Stratiform,
+        500.0f + 1000.0f * static_cast<float>(index),
+        1000.0f + 1000.0f * static_cast<float>(index), 0.0f, 0.0f,
+        1.0f, 0.0f, 0.0f};
+  }
+  disabled_slots_profile.cloud_layer_count =
+      static_cast<std::uint8_t>(cloud::kMaximumCloudLayers);
+  cloud::weather_detail::finishProfile(disabled_slots_profile);
+  const bool disabled_cloud_slots_compact =
+      disabled_slots_profile.cloud_layer_count == 0U;
 
   cloud::SkyEnvironmentConfig outside_config = sky_config;
   outside_config.time_scale = 0.0f;
@@ -1614,9 +1876,12 @@ int runSelfTest() {
       low_cloud_height > 0.05f && low_cloud_height < 0.45f &&
       high_cloud_height > 0.55f && high_cloud_height < 0.95f &&
       high_cloud_height - low_cloud_height > 0.35f &&
-      zero_coverage_layer_is_inert && negligible_layer_filtered &&
+      all_four_layers_forced &&
+      zero_coverage_layer_is_inert && disabled_cloud_slots_compact &&
+      negligible_layer_filtered &&
       outside_layer_isolated && partial_layer_optics_ok &&
       physical_vertical_units_ok &&
+      layer_metadata_plateau_free && emitter_plane_variation_ok &&
       source_free_simulation.densityStats().maximum == 0.0f;
 
   cloud::SkyEnvironmentConfig transition_config = sky_config;
@@ -1832,7 +2097,14 @@ int runSelfTest() {
             << std::dec
             << " forcing=" << (forcing_ok ? "yes" : "no")
             << " layer_centers=" << low_cloud_height << ','
-            << high_cloud_height << '\n';
+            << high_cloud_height
+            << " plateau_planes="
+            << plateau_diagnostics.uniform_active_plane_count
+            << " varied_plane_coverage="
+            << varied_emitter_diagnostics.representative_active_fraction
+            << " varied_plane_cv="
+            << varied_emitter_diagnostics.representative_relative_deviation
+            << '\n';
 
   if (!fields_ok || !cloud_formed || !finite || !protocol_ok ||
       !interaction_ok || !astronomy_ok || !clock_pause_ok ||
@@ -1857,8 +2129,34 @@ int runSelfTest() {
               << " catch_up=" << catch_up_ok
               << " long_gap=" << long_gap_ok
               << " weather=" << weather_ok
+              << " weather_parts=" << transition_midpoint_ok << ','
+              << natural_fog_reachable << ','
+              << natural_threshold_smoothing_ok << ','
+              << immediate_natural_release_ok << ','
+              << natural_relaxation_ok << ','
+              << accelerated_transition_ok << ','
+              << accelerated_natural_time_ok
+              << " natural_relaxation_ratios=" << relaxation_ratio_4hz
+              << ',' << relaxation_ratio_20hz
+              << " time_lapse_ratios=" << accelerated_ratio_4hz << ','
+              << accelerated_ratio_20hz << ',' << reverse_ratio_20hz
+              << " accelerated_fog_step="
+              << maximum_fog_coverage_step
               << " forcing=" << forcing_ok
               << " layers=" << layer_forcing_ok
+              << " plateau_free=" << layer_metadata_plateau_free
+              << " plateau_max=" << plateau_diagnostics.maximum_density
+              << " plateau_active_planes="
+              << plateau_diagnostics.active_plane_count
+              << " plateau_uniform_planes="
+              << plateau_diagnostics.uniform_active_plane_count
+              << " emitter_variation=" << emitter_plane_variation_ok
+              << " emitter_max="
+              << varied_emitter_diagnostics.maximum_density
+              << " emitter_plane_coverage="
+              << varied_emitter_diagnostics.representative_active_fraction
+              << " emitter_plane_cv="
+              << varied_emitter_diagnostics.representative_relative_deviation
               << " layer_transition=" << layer_transition_packets_ok
               << " control_mode=" << control_mode_ok
               << " sparse_layer=" << sparse_layer_ok

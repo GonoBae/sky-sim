@@ -113,6 +113,7 @@ public:
     const WeatherState &weather = snapshot_.weather;
     CloudForcing forcing;
     forcing.enabled = true;
+    forcing.spatial_seed = weather_.seed();
     float coverage = 0.0f;
     float optical_depth = 0.0f;
     for (std::size_t index = 0; index < snapshot_.cloud_layer_count; ++index) {

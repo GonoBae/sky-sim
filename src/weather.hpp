@@ -157,6 +157,18 @@ inline void finishProfile(WeatherProfile &profile) {
     if (layer.kind == CloudLayerKind::None) {
       continue;
     }
+    // Authoring clients commonly send all four SKC1 layer masks atomically.
+    // A disabled slot therefore arrives as a valid kind with zero influence.
+    // Compact it exactly like `None` so it cannot survive in SKS1 metadata as
+    // a one-metre ghost layer or consume one of the four active slots.
+    const bool zero_effect_layer =
+        std::abs(layer.coverage) < 0.0001f &&
+        std::abs(layer.optical_depth) < 0.01f &&
+        std::abs(layer.precipitation_rate_mm_h) < 0.001f &&
+        std::abs(layer.convective_activity) < 0.001f;
+    if (zero_effect_layer) {
+      continue;
+    }
     layer.base_altitude_m = std::max(0.0f, layer.base_altitude_m);
     layer.top_altitude_m =
         std::max(layer.base_altitude_m + 1.0f, layer.top_altitude_m);
@@ -217,10 +229,21 @@ inline WeatherProfile fixedProfile(WeatherPreset preset) {
     value.gust_speed_m_s = 7.0f;
     value.convective_activity = 0.45f;
     value.aerosol_optical_depth_550nm = 0.10f;
+    // Fair-weather skies are rarely a single perfectly uniform slab. Keep a
+    // broken boundary layer below the growing cumulus field and a sparse ice
+    // veil aloft so renderers receive useful depth cues all the way to the
+    // horizon. Individual emitters add further height and thickness variance
+    // inside each of these atmospheric bands.
     result.cloud_layers[0] =
-        layer(CloudLayerKind::Convective, 1200.0f, 3600.0f, 0.42f, 7.0f,
+        layer(CloudLayerKind::Stratiform, 650.0f, 1550.0f, 0.24f, 2.0f,
+              0.98f, 0.0f, 0.12f);
+    result.cloud_layers[1] =
+        layer(CloudLayerKind::Convective, 1050.0f, 4100.0f, 0.60f, 7.0f,
               0.95f, 0.0f, 0.55f);
-    result.cloud_layer_count = 1;
+    result.cloud_layers[2] =
+        layer(CloudLayerKind::Cirrus, 7600.0f, 10800.0f, 0.16f, 0.7f,
+              0.03f, 0.0f, 0.04f);
+    result.cloud_layer_count = 3;
     break;
   case WeatherPreset::Overcast:
     value.surface_temperature_kelvin = 289.15f;
@@ -233,9 +256,15 @@ inline WeatherProfile fixedProfile(WeatherPreset preset) {
     value.convective_activity = 0.25f;
     value.aerosol_optical_depth_550nm = 0.16f;
     result.cloud_layers[0] =
-        layer(CloudLayerKind::Stratiform, 650.0f, 4300.0f, 0.96f, 32.0f,
-              0.90f, 0.15f, 0.20f);
-    result.cloud_layer_count = 1;
+        layer(CloudLayerKind::Stratiform, 500.0f, 2200.0f, 0.96f, 24.0f,
+              0.94f, 0.15f, 0.14f);
+    result.cloud_layers[1] =
+        layer(CloudLayerKind::Stratiform, 1900.0f, 4700.0f, 0.72f, 11.0f,
+              0.78f, 0.05f, 0.24f);
+    result.cloud_layers[2] =
+        layer(CloudLayerKind::Cirrus, 7600.0f, 10500.0f, 0.18f, 0.9f,
+              0.04f, 0.0f, 0.05f);
+    result.cloud_layer_count = 3;
     break;
   case WeatherPreset::Rain:
     value.surface_temperature_kelvin = 287.15f;
@@ -248,9 +277,15 @@ inline WeatherProfile fixedProfile(WeatherPreset preset) {
     value.convective_activity = 0.55f;
     value.aerosol_optical_depth_550nm = 0.22f;
     result.cloud_layers[0] =
-        layer(CloudLayerKind::Stratiform, 450.0f, 6200.0f, 0.99f, 58.0f,
-              0.85f, 8.0f, 0.45f);
-    result.cloud_layer_count = 1;
+        layer(CloudLayerKind::Stratiform, 350.0f, 2600.0f, 0.99f, 39.0f,
+              0.90f, 8.0f, 0.32f);
+    result.cloud_layers[1] =
+        layer(CloudLayerKind::Convective, 900.0f, 6900.0f, 0.58f, 25.0f,
+              0.70f, 8.0f, 0.62f);
+    result.cloud_layers[2] =
+        layer(CloudLayerKind::Stratiform, 3100.0f, 5900.0f, 0.70f, 12.0f,
+              0.62f, 2.0f, 0.30f);
+    result.cloud_layer_count = 3;
     break;
   case WeatherPreset::Storm:
     value.surface_temperature_kelvin = 293.15f;
@@ -283,9 +318,15 @@ inline WeatherProfile fixedProfile(WeatherPreset preset) {
     value.convective_activity = 0.35f;
     value.aerosol_optical_depth_550nm = 0.12f;
     result.cloud_layers[0] =
-        layer(CloudLayerKind::Stratiform, 400.0f, 4800.0f, 0.98f, 48.0f,
-              0.12f, 5.0f, 0.30f);
-    result.cloud_layer_count = 1;
+        layer(CloudLayerKind::Stratiform, 300.0f, 2300.0f, 0.98f, 34.0f,
+              0.15f, 5.0f, 0.24f);
+    result.cloud_layers[1] =
+        layer(CloudLayerKind::Stratiform, 2100.0f, 5200.0f, 0.72f, 16.0f,
+              0.07f, 2.0f, 0.34f);
+    result.cloud_layers[2] =
+        layer(CloudLayerKind::Cirrus, 6500.0f, 9000.0f, 0.25f, 1.5f,
+              0.01f, 0.0f, 0.05f);
+    result.cloud_layer_count = 3;
     break;
   case WeatherPreset::Fog:
     value.surface_temperature_kelvin = 283.15f;
@@ -413,18 +454,48 @@ inline WeatherProfile naturalProfile(double unix_seconds,
     const float top = convective
                           ? 2800.0f + 8200.0f * weather.convective_activity
                           : lifted_base + 1700.0f + 2600.0f * coverage;
-    result.cloud_layers[0] = layer(
+
+    // Moist boundary layers commonly coexist with deeper cells. Generate the
+    // low broken field independently so natural weather has visibly different
+    // bases and thicknesses instead of moving one homogeneous sheet upward.
+    if (convective && coverage > 0.28f) {
+      result.cloud_layers[result.cloud_layer_count++] = layer(
+          CloudLayerKind::Stratiform, std::max(80.0f, lifted_base * 0.52f),
+          lifted_base + 520.0f + 650.0f * coverage,
+          std::clamp(0.12f + 0.42f * coverage, 0.0f, 0.58f),
+          0.8f + 5.0f * coverage, 0.98f, precipitation * 0.08f,
+          weather.convective_activity * 0.22f);
+    }
+
+    result.cloud_layers[result.cloud_layer_count++] = layer(
         convective ? CloudLayerKind::Convective : CloudLayerKind::Stratiform,
         lifted_base, top, coverage,
         2.0f + 70.0f * coverage * coverage, 1.0f - 0.55f * storminess,
         precipitation, weather.convective_activity);
-    result.cloud_layer_count = 1;
+
+    // Moist but weakly convective systems often contain a separate middle
+    // deck. Its coverage responds more slowly than the primary layer and its
+    // altitude is deliberately disjoint, which improves distant silhouettes.
+    if (!convective && coverage > 0.62f &&
+        result.cloud_layer_count < kMaximumCloudLayers) {
+      result.cloud_layers[result.cloud_layer_count++] = layer(
+          CloudLayerKind::Stratiform, top + 350.0f,
+          top + 1350.0f + 1200.0f * storminess,
+          std::clamp(0.16f + 0.38f * coverage, 0.0f, 0.62f),
+          1.5f + 11.0f * coverage, 0.55f, precipitation * 0.20f,
+          weather.convective_activity * 0.55f);
+    }
   }
-  if (weather.convective_activity > 0.72f && result.cloud_layer_count < 4) {
+  if ((weather.convective_activity > 0.58f || coverage > 0.78f) &&
+      result.cloud_layer_count < kMaximumCloudLayers) {
     result.cloud_layers[result.cloud_layer_count++] = layer(
-        CloudLayerKind::Cirrus, 8200.0f, 12500.0f,
-        0.35f + 0.55f * weather.convective_activity,
-        2.0f + 9.0f * weather.convective_activity, 0.02f, 0.0f,
+        CloudLayerKind::Cirrus,
+        7600.0f + 900.0f * (1.0f - storminess),
+        10800.0f + 1900.0f * weather.convective_activity,
+        std::clamp(0.12f + 0.58f * weather.convective_activity +
+                       0.12f * coverage,
+                   0.0f, 0.88f),
+        0.8f + 9.5f * weather.convective_activity, 0.02f, 0.0f,
         weather.convective_activity);
   }
   // Calm nocturnal boundary layers can saturate even when the synoptic-scale
@@ -646,6 +717,9 @@ public:
     transition_elapsed_seconds_ = transition_duration_seconds_ = 0.0;
     transition_target_initialized_ = false;
     snap_to_target_on_next_advance_ = false;
+    last_unix_seconds_ = unix_seconds;
+    last_unix_initialized_ = true;
+    natural_relaxation_credit_seconds_ = 0.0;
   }
 
   void setPreset(WeatherPreset preset, double transition_seconds) {
@@ -687,6 +761,17 @@ public:
       throw std::invalid_argument("Weather dt must be finite and non-negative");
     }
     const WeatherProfile target = targetFor(unix_seconds, location);
+    const double calendar_motion_seconds =
+        last_unix_initialized_ ? std::abs(unix_seconds - last_unix_seconds_)
+                               : 0.0;
+    // A zero-dt query must not consume a later calendar jump. This is useful
+    // while an editor details panel is scrubbing UTC before its next preview
+    // tick. Positive ticks, including reverse time, record the absolute
+    // calendar motion and remain direction agnostic.
+    if (real_dt > 0.0) {
+      last_unix_seconds_ = unix_seconds;
+      last_unix_initialized_ = true;
+    }
     if (snap_to_target_on_next_advance_) {
       current_ = target;
       current_.weather.transition_progress = 1.0f;
@@ -712,8 +797,28 @@ public:
       // change. Relax toward that target in wall time so normal simulation
       // ticks never pop a full layer or visibility field in one snapshot.
       constexpr double natural_response_seconds = 120.0;
+      // At 1x, weather retains the calm two-minute response above. When the
+      // calendar is accelerated, carry excess simulated time as a bounded
+      // relaxation credit and consume it at no more than 48x wall time. This
+      // makes clouds/weather visibly follow an editor time-lapse while keeping
+      // layer births and kind thresholds on a >=2.5 second visual time scale.
+      // The credit also makes the result independent of a 4 Hz versus 20 Hz
+      // caller and safely handles large UTC jumps or reverse playback.
+      constexpr double maximum_response_multiplier = 48.0;
+      constexpr double maximum_relaxation_credit_seconds = 600.0;
+      const double excess_calendar_motion =
+          std::max(0.0, calendar_motion_seconds - real_dt);
+      natural_relaxation_credit_seconds_ = std::min(
+          maximum_relaxation_credit_seconds,
+          natural_relaxation_credit_seconds_ + excess_calendar_motion);
+      const double credit_consumed = std::min(
+          natural_relaxation_credit_seconds_,
+          real_dt * (maximum_response_multiplier - 1.0));
+      natural_relaxation_credit_seconds_ -= credit_consumed;
+      const double effective_response_dt = real_dt + credit_consumed;
       const float response = static_cast<float>(
-          1.0 - std::exp(-real_dt / natural_response_seconds));
+          1.0 - std::exp(-effective_response_dt /
+                         natural_response_seconds));
       current_ =
           weather_detail::mixProfiles(current_, target, response, false);
       current_.weather.preset = WeatherPreset::Natural;
@@ -767,6 +872,7 @@ private:
     transition_duration_seconds_ = transition_seconds;
     transition_target_initialized_ = false;
     snap_to_target_on_next_advance_ = transition_seconds == 0.0;
+    natural_relaxation_credit_seconds_ = 0.0;
   }
 
   WeatherPreset requested_preset_ = WeatherPreset::Cumulus;
@@ -777,10 +883,13 @@ private:
   WeatherProfile custom_target_{};
   double transition_elapsed_seconds_ = 0.0;
   double transition_duration_seconds_ = 0.0;
+  double last_unix_seconds_ = 0.0;
+  double natural_relaxation_credit_seconds_ = 0.0;
   float surface_wetness_ = 0.0f;
   bool has_custom_target_ = false;
   bool transition_target_initialized_ = false;
   bool snap_to_target_on_next_advance_ = false;
+  bool last_unix_initialized_ = false;
 };
 
 } // namespace cloud

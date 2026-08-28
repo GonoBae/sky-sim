@@ -7,8 +7,39 @@ CMakeUserPresets.json
 # Generated simulation captures and Python caches
 *.raw
 received-frame/
+/run/
 __pycache__/
 *.pyc
+
+# Unreal Engine generated output
+/Unreal/**/.idea/
+/Unreal/**/.vs/
+/Unreal/**/Binaries/
+/Unreal/**/DerivedDataCache/
+/Unreal/**/Intermediate/
+/Unreal/**/Saved/
+/Unreal/**/*.sln
+
+# Unused content from the project-creation template; NewWorld is the shipped map
+/Unreal/uskysim/Content/SimBlank/
+
+# Local Windows/Editor automation used only for interactive visual QA
+/tools/capture_process_window.py
+/tools/click_process_window.py
+/tools/configure_unreal_cloud_visibility.py
+/tools/diagnose_unreal_material_pins.py
+/tools/focus_and_hold_process_key.py
+/tools/focus_and_move_process_mouse.py
+/tools/focus_unreal_cloud_overview.py
+/tools/focus_unreal_editor_preview.py
+/tools/list_process_windows.py
+/tools/move_process_window.py
+/tools/save_and_close_process_window.py
+/tools/save_and_quit_unreal.py
+/tools/scroll_process_window.py
+/tools/start_unreal_play.py
+/tools/start_unreal_sky_preview.py
+/tools/type_process_window.py
 
 # Editor and operating-system files
 .DS_Store

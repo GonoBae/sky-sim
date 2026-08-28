@@ -252,16 +252,33 @@ sequence를 증가시킵니다. 불안정한 네트워크에서는 마지막 서
 - control port `7780`을 인터넷에 직접 노출하지 않음
 - 서버 로그의 rejected/stale control counter 감시
 
-## Unreal 최소 제어 UI
+## 현재 Unreal Details 매핑
 
-레벨별 Blueprint에 많은 weather parameter를 흩어놓지 말고, 하나의 `SkySimSystem`이 다음
-항목만 노출하는 구성이 권장됩니다.
+포함된 `Unreal/uskysim`은 하나의 `SkySimSystem`에서 다음 제어를 제공합니다.
 
-- preset + transition seconds
-- UTC/일시 + time scale
-- latitude/longitude/elevation
-- advanced override: wind, humidity, visibility, precipitation, cloud layer
+- `Time and Location`: 현지 일시, UTC offset, 위도·경도·고도, time scale과
+  Apply/Pause/Resume
+- `Weather`: Natural/preset, transition seconds, seed, Apply와
+  `Release Weather To Natural`
+- `Weather | Advanced`: thermodynamics, visibility, wind, precipitation, convection
+- `Cloud Authoring`: 네 layer slot의 type, AGL base/top, coverage, optical depth, phase,
+  precipitation과 일괄 Apply
+- `Network`: control host/port와 keyframe 요청
+- `Control Status`: Pending/Applied/Rejected/TimedOut, sequence와 서버 result
 
-UI는 이 값을 `SKC1` command로 만들고, 화면에 표시할 실제 값은 로컬 입력이 아니라 다시
-수신한 `SKS1`을 사용합니다. 이렇게 해야 서버의 clamp, transition과 자연 날씨 결과가
-Unreal 화면 및 운영 UI에서 일치합니다.
+Editor Preview에서는 Details 변경을 0.25초 debounce한 뒤 하나의 ACK-serialized queue로
+전송합니다. ACK를 기다리는 동안 다음 명령은 합쳐지거나 순서대로 대기하며, 재전송은 같은
+session/sequence/datagram을 사용합니다. 서버 상태가 돌아오면 `SKS1`의
+`last_control_*`를 기준으로 최종 상태를 표시합니다.
+
+`Sync Authoring Settings On Connect`는 재연결 시 날짜·위치·time scale·preset을 다시
+적용합니다. `Apply Advanced Weather On Connect`는 기본 꺼짐입니다. Advanced Weather나
+직접 작성한 Cloud Layers를 적용하면 Natural이 manual override로 바뀌기 때문입니다.
+자동 날씨로 돌아갈 때는 `Release Weather To Natural`을 사용합니다.
+
+`Weather Seed`는 Natural weather뿐 아니라 서버의 deterministic cloud-family 공간 배치에도
+들어갑니다. seed 변경 시 이전 density field를 재초기화하고 새로운 family 중심, 구름 크기와
+위성 cell을 생성합니다.
+
+정확한 조작 순서와 기본값은 [Unreal Editor 사용 가이드](unreal-editor-guide.md)를
+참고하십시오.

@@ -27,6 +27,27 @@
 독립 UDP이므로 항상 동시에 도착하지는 않습니다. 수신기는 각 스트림의 최신 완성 상태를
 따로 보관하고 `volume_frame_id`를 동기화 힌트로만 사용해야 합니다.
 
+## 현재 Unreal 소비 필드
+
+포함된 `SkySimSystem`은 현재 다음 `SKS1` 값을 직접 사용합니다.
+
+| 상태 | 현재 Unreal 용도 |
+|---|---|
+| UTC, 위치, elevation, time scale | Server State 표시와 editor authoring 동기화 |
+| domain extent, cloud layer count | Heterogeneous Volume 크기와 상태 표시 |
+| sun direction/color/lux | 태양 Directional Light |
+| moon direction/phase/lux | 달 Directional Light |
+| relative humidity, visibility | `SkySimWeatherFog` 밀도 계산 |
+| mean wind | 광역 weather-map 이동 |
+| control session/sequence/result | `SKC1` ACK queue 완료·거부·timeout 판정 |
+
+구름 voxel density는 이 packet에 들어 있지 않으며 별도 `CLD2` field ID 1을 사용합니다.
+Weather Fog도 cloud layer가 아닙니다. Unreal이 `SKS1.visibility`와 humidity에서 파생해 만든
+`ExponentialHeightFog` 표현이므로, 지면의 뿌연 층과 3D cloud density를 진단할 때 두 경로를
+구분해야 합니다. 현재 fog 활성 조건과 임시 비활성화 방법은
+[Unreal Editor 사용 가이드](unreal-editor-guide.md#현재-weather-fog-동작과-알려진-제한)에
+정리되어 있습니다.
+
 ## 공통 헤더
 
 | Offset | Type | 이름 | 단위/의미 |

@@ -27,14 +27,22 @@ Engine의 전용 GPU 렌더러로 전달하는 실시간 시뮬레이션 서버�
 - 최대 4개 고도 구름층, 대기 Rayleigh/Mie/ozone 계수와 물리 단위 바람·상승가속도의 구름
   유체 forcing 연동
 - `SKS1` 512바이트 전역 하늘 상태와 `SKC1` 실시간 날씨 제어 프로토콜
+- seed 기반 cloud-family 군집, 위성 셀, 레이어·수명별 크기/높이/두께 변화
+- Cumulus/Overcast/Rain/Snow의 다중 고도 레이어와 가속·역방향 Natural weather 추종
+- Unreal Engine 5.6 `SkySimSystem`: Play 없이 editor preview, 태양·달·대기·안개와
+  Heterogeneous Volume 구름 렌더링
+- 120km Wide Cloud World, 광역 청천 통로, 좌표 warp와 비정수 이중 density sample 기반
+  de-tiling
+- WASD/QE 자유 비행 Spectator와 정상 Mouse Y/선택적 invert
 - 첫 전송부터 구름이 보이도록 하는 기본 2초 사전 시뮬레이션
 - 기존 단일 밀도 프로토콜 v1 호환 모드
 - macOS, Linux, Windows 소켓 코드
 
 현재 기본 격자는 `64 x 64 x 64`입니다. 서버 밀도는 구름의 큰 형태와 물체 후류를
-나타내며, TrueSky 계열의 표면 디테일은 Unreal GPU에서 월드 좌표 기반
-Worley/Perlin/Curl 노이즈와 대기·구름 산란으로 추가합니다. Unreal 기본
-`VolumetricCloud`는 사용하지 않습니다.
+나타냅니다. 포함된 Unreal 기준 구현은 엔진 erosion volume, regional coverage mask,
+좌표 warp와 두 개의 live-density lookup으로 표면과 원거리 반복을 보정합니다. Unreal 기본
+`VolumetricCloud`는 사용하지 않습니다. velocity 기반 temporal 보간과 전용 all-sky ray
+marcher는 현재 구현이 아니라 다음 렌더러 단계입니다.
 
 ## 빌드
 
@@ -74,9 +82,9 @@ python3 tools/receive_sky.py --port 7779
 
 ```bash
 ./build/cloud_sim_server \
-  --utc 2026-08-25T03:00:00Z \
+  --utc 2026-08-26T07:00:00Z \
   --latitude 37.5665 --longitude 126.9780 --elevation-m 38 \
-  --weather natural --weather-seed 42 --time-scale 3600
+  --weather natural --weather-seed 55 --time-scale 60
 ```
 
 실행 중 폭풍으로 8초간 부드럽게 전환하려면 제어 도구를 사용합니다.
@@ -142,23 +150,50 @@ index = (z * grid_y + y) * grid_x + x
 속도 필드는 voxel당 `x, y, z` 순서로 세 채널이 연속 저장됩니다. occupancy의 한 voxel이 나타내는 원본 격자 폭은 헤더 `flags`의 상위 8비트에 기록됩니다. 기본값은 `4`입니다.
 
 전체 v2 헤더와 RLE 형식은 [프로토콜 v2 문서](docs/protocol-v2.md)에 정의되어 있습니다.
-custom ray marcher와 조명·노이즈·temporal 구성은
-[Unreal 렌더링 가이드](docs/unreal-rendering.md)를 따릅니다.
+현재 Unreal 프로젝트 사용법은 [Unreal Editor 사용 가이드](docs/unreal-editor-guide.md),
+전용 ray marcher와 temporal 확장 설계는
+[Unreal 렌더링 아키텍처와 로드맵](docs/unreal-rendering.md)을 따릅니다.
 
-## Unreal 렌더러 계약
+## Unreal Engine 5.6 프로젝트
 
-언리얼 플러그인은 다음 순서로 처리하는 것을 권장합니다.
+`Unreal/uskysim`에는 실행 가능한 기준 프로젝트가 포함됩니다. `NewWorld`의
+`SkySimSystem` 액터 하나가 Play 없이 `CLD2`/`SKS1`을 수신하고, Details에서 날짜·위치,
+시간 배속, Natural/preset/고급 날씨, 최대 네 개 구름층, 태양·달·Sky Light, Weather Fog,
+광역 구름과 presentation 값을 직접 조정합니다.
 
-1. UDP 스레드에서 같은 `frame_id`의 필드를 조립하고 CRC를 검사합니다.
-2. `SKS1`을 검증하고 UTC·태양/달·대기·날씨 상태 두 개를 시간 보간합니다.
-3. 모든 `field_mask` 필드가 완성된 최신 프레임만 렌더 스레드로 전달합니다.
-4. density를 3D `R16_UNORM`, velocity를 3D `RGB16_SNORM` GPU 리소스로 업로드합니다.
-5. 직전/현재 density를 velocity로 보간하여 기본 10Hz 전송의 끊김을 감춥니다.
-6. occupancy를 사용해 빈 구간을 건너뛰고 서버 density 가장자리에 고주파 절차 노이즈를 적용합니다.
-7. `SKS1` 광학 계수와 천체 방향으로 대기 LUT, 구름 조명, 해·달·별, 강수·안개를 한 render pipeline에서 합성합니다.
-8. 저해상도 ray march, temporal accumulation, bilateral upscale 순서로 Scene Color에 합성합니다.
+서버의 물리 reference domain은 기본 20km이고 Unreal은 이를 기본 120km로 확장합니다.
+서버 쪽 cloud-family 군집과 크기·높이 변화에 더해, 렌더러 쪽 regional clear-sky mask,
+position warp와 비정수 보조 density sample이 균일한 배치와 6×6 반복을 줄입니다.
 
-수신기는 UDP 콜백에서 UObject나 RHI 리소스를 직접 수정하지 않고, 완성된 CPU 버퍼만 game/render thread에 넘겨야 합니다.
+UE 에디터 프리뷰에는 실제 사용하는 density만 5Hz로 보내는 다음 구성이 부하와 반응성의
+균형이 좋습니다. 저장된 `NewWorld`는 Natural seed 55와 60배속을 사용합니다.
+
+```powershell
+& ".\build\Release\cloud_sim_server.exe" `
+  --grid 64 --hz 5 --send-hz 5 --protocol 2 --fields density --compression auto `
+  --weather natural --weather-seed 55 --time-scale 60 `
+  --domain-width-m 20000 --domain-height-m 14000
+```
+
+```powershell
+$ueRoot = "C:\Program Files\Epic Games\UE_5.6"
+$project = (Resolve-Path ".\Unreal\uskysim\uskysim.uproject").Path
+
+& "$ueRoot\Engine\Build\BatchFiles\Build.bat" `
+  uskysimEditor Win64 Development `
+  "-Project=$project" `
+  -WaitMutex -NoHotReloadFromIDE
+```
+
+현재 처리 경로는 game/editor tick 수신, RLE/CRC/frame 조립, density CPU shaping,
+transient `PF_G16` texture upload, Heterogeneous Volume material 표시와 `SKS1` 환경 component
+갱신입니다. velocity 보간, occupancy skip, custom RDG ray march와 temporal upscale는 목표
+구조이며 현재 기능으로 간주하면 안 됩니다.
+
+전체 설치, Details 속성, Spectator 조작, 안개 구분, 머티리얼 재생성과 문제 해결은
+[Unreal Editor 사용 가이드](docs/unreal-editor-guide.md)에 정리되어 있습니다.
+이번 Unreal 통합과 구름 분포 개선의 파일별 범위·기본값·검증 항목은
+[구현 현황 및 검증 기록](docs/implementation-status.md)을 참고하십시오.
 
 ## 해상도와 전송량
 
@@ -178,14 +213,17 @@ v1은 40바이트 `CLD1` 헤더와 `uint8` optical density 하나만 보냅니�
 현재 natural weather는 날짜·위치·seed에 따라 연속적으로 변하는 결정론적 절차 모델입니다.
 실제 수치예보나 관측 동화가 아니며, 지역별 전선·지형성 상승·레이더 강수대를 공간적으로
 재현하지 않습니다. 번개는 event/flash 상태까지만 만들며 볼트 위치·형상·음향, 비·눈
-입자와 젖은 지면 표현은 Unreal 렌더러가 구현해야 합니다. 이 저장소에는 아직 Unreal
-플러그인 자체가 포함되어 있지 않습니다.
+입자와 젖은 지면 표현은 후속 Unreal 렌더 패스가 구현해야 합니다. 현재 포함된 Unreal
+프로젝트는 Heterogeneous Volume 기반 구름, 태양·달·대기·Sky Light와 시정·습도 기반
+안개, editor preview, Spectator 조작까지 연결하며, 강수 입자·번개 볼트·젖은 지면 셰이더는
+아직 범위 밖입니다.
 
 개발 단계는 다음 순서가 안전합니다.
 
 1. **현재 기반**: 시간·위치·preset/natural weather, 태양·달, 대기 광학, 구름 forcing,
    `SKS1`/`SKC1`
-2. **Unreal 단일 시스템**: 대기 LUT, 전용 구름 ray marcher, 해·달·별과 depth/shadow 합성
+2. **Unreal 단일 시스템**: 현재 Heterogeneous Volume 연결을 전용 구름 ray marcher,
+   해·달·별과 depth/shadow 합성으로 확장
 3. **국지 현상**: 3D 강수 shaft, 지표 안개, 번개 위치/분기, 젖음·적설 feedback
 4. **중규모 날씨**: 전선과 기단, 지형·해륙풍, 공간 pressure/humidity/temperature field
 5. **대규모 운용**: sparse multi-domain GPU simulation, 관측/예보 입력, timeline/replay,

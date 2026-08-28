@@ -101,6 +101,9 @@ def main():
     control_port = reserve_udp_port()
     while control_port == state_port:
         control_port = reserve_udp_port()
+    interactor_control_port = reserve_udp_port()
+    while interactor_control_port in (state_port, control_port):
+        interactor_control_port = reserve_udp_port()
 
     receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     receiver.bind(("127.0.0.1", state_port))
@@ -114,6 +117,8 @@ def main():
             "--warmup-seconds", "0",
             "--seconds", "2.8",
             "--no-send",
+            "--control-host", "127.0.0.1",
+            "--control-port", str(interactor_control_port),
             "--sky-host", "127.0.0.1",
             "--sky-port", str(state_port),
             "--sky-hz", "30",

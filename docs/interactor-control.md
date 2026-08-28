@@ -1,5 +1,10 @@
 # Dynamic interactor control (`CLC2`)
 
+> 구현 상태: 서버의 `CLC2` 수신·moving-solid/wake 계산과
+> `tools/send_interactor.py` 참조 송신기는 구현되어 있습니다. 현재 포함된
+> `Unreal/uskysim`에는 Actor transform을 자동 전송하는 `SkySimInteractorComponent`가 아직
+> 없습니다. 아래 Unreal component 설명은 다음 통합 단계의 계약입니다.
+
 `CLC2`는 비행기·차량·캐릭터 같은 Unreal 물체의 상태를 서버에 전달하는 단방향 UDP 제어 프로토콜입니다. Unreal은 물체의 위치와 속도만 주기적으로 보내고, 서버가 다음 효과를 밀도·속도 볼륨에 반영합니다.
 
 - `solid`: 물체 표면과 내부의 유체 속도를 물체 속도에 결합

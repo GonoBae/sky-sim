@@ -57,6 +57,9 @@ struct CloudForcingLayer {
 
 struct CloudForcing {
   bool enabled = false;
+  // Changes the deterministic cloud-family layout without coupling the fluid
+  // solver to the higher-level weather model.
+  std::uint32_t spatial_seed = 1U;
 
   // The profile is sampled linearly by normalized grid height. Keeping the
   // heights explicit lets a weather model concentrate shear near a boundary
@@ -176,7 +179,15 @@ public:
 
   void setEnvironmentalForcing(const CloudForcing &forcing) {
     validateEnvironmentalForcing(forcing);
+    const bool spatial_seed_changed =
+        environmental_forcing_.spatial_seed != forcing.spatial_seed;
     environmental_forcing_ = forcing;
+    if (spatial_seed_changed) {
+      // A seed edit is an explicit request for a different sky realization.
+      // Rebuilding at zero density avoids morphing old condensate through the
+      // new emitter family map.
+      reset();
+    }
   }
 
   void setInteractors(std::vector<CloudInteractor> interactors) {
@@ -234,16 +245,67 @@ public:
     interaction_stats_ = {};
     interaction_cell_budget_ = 0;
     time_ = 0.0f;
-    constexpr std::array<float, 4> source_x_fractions{
-        0.31f, 0.67f, 0.17f, 0.82f};
-    constexpr std::array<float, 4> source_y_fractions{
-        0.23f, 0.74f, 0.61f, 0.38f};
-    for (std::size_t index = 0; index < layer_source_x_cells_.size();
-         ++index) {
-      layer_source_x_cells_[index] =
-          source_x_fractions[index] * static_cast<float>(n_);
-      layer_source_y_cells_[index] =
-          source_y_fractions[index] * static_cast<float>(n_);
+    // Real cloud streets contain organized families separated by clear air;
+    // they are not a blue-noise carpet of equally spaced cells.  Three broad
+    // family anchors keep the small periodic reference domain useful while
+    // deterministic, anisotropic scatter gives each family its own footprint.
+    // A few satellite cells are deliberately left outside the families.
+    constexpr std::array<float, 3> family_anchor_x{
+        0.17f, 0.58f, 0.82f};
+    constexpr std::array<float, 3> family_anchor_y{
+        0.23f, 0.76f, 0.38f};
+    constexpr float pi = 3.14159265358979323846f;
+    for (std::size_t layer_index = 0;
+         layer_index < layer_source_x_cells_.size(); ++layer_index) {
+      for (std::size_t source_index = 0;
+           source_index < kMaximumLayerSources; ++source_index) {
+        const std::size_t family_index = source_index % family_anchor_x.size();
+        const float family_center_x = wrapUnit(
+            family_anchor_x[family_index] +
+            (sourceRandomUnit(layer_index, family_index, 11U) - 0.5f) *
+                0.18f);
+        const float family_center_y = wrapUnit(
+            family_anchor_y[family_index] +
+            (sourceRandomUnit(layer_index, family_index, 12U) - 0.5f) *
+                0.18f);
+        const float family_radius =
+            0.055f + 0.070f *
+                         sourceRandomUnit(layer_index, family_index, 13U);
+        const float family_aspect =
+            1.15f + 0.95f *
+                         sourceRandomUnit(layer_index, family_index, 14U);
+        const float family_orientation =
+            2.0f * pi *
+            sourceRandomUnit(layer_index, family_index, 15U);
+        const float scatter_radius = family_radius * std::sqrt(
+            sourceRandomUnit(layer_index, source_index, 16U));
+        const float scatter_angle =
+            2.0f * pi *
+            sourceRandomUnit(layer_index, source_index, 17U);
+        const float local_x =
+            std::cos(scatter_angle) * scatter_radius * family_aspect;
+        const float local_y =
+            std::sin(scatter_angle) * scatter_radius / family_aspect;
+        const float offset_x =
+            std::cos(family_orientation) * local_x -
+            std::sin(family_orientation) * local_y;
+        const float offset_y =
+            std::sin(family_orientation) * local_x +
+            std::cos(family_orientation) * local_y;
+        const bool is_satellite =
+            source_index >= 6U &&
+            sourceRandomUnit(layer_index, source_index, 18U) > 0.84f;
+        const float source_x_fraction = is_satellite
+            ? sourceRandomUnit(layer_index, source_index, 19U)
+            : wrapUnit(family_center_x + offset_x);
+        const float source_y_fraction = is_satellite
+            ? sourceRandomUnit(layer_index, source_index, 20U)
+            : wrapUnit(family_center_y + offset_y);
+        layer_source_x_cells_[layer_index][source_index] =
+            source_x_fraction * static_cast<float>(n_);
+        layer_source_y_cells_[layer_index][source_index] =
+            source_y_fraction * static_cast<float>(n_);
+      }
     }
   }
 
@@ -411,6 +473,45 @@ public:
       sum += value;
     }
     stats.mean = static_cast<float>(sum / static_cast<double>(count_));
+    return stats;
+  }
+
+  SimulationStats densityStatsInNormalizedHeightRange(float minimum_height,
+                                                       float maximum_height) const {
+    if (!std::isfinite(minimum_height) || !std::isfinite(maximum_height) ||
+        minimum_height < 0.0f || maximum_height > 1.0f ||
+        maximum_height <= minimum_height) {
+      throw std::invalid_argument(
+          "Density height range must be finite, ordered, and in [0, 1]");
+    }
+    const int minimum_z = std::clamp(
+        static_cast<int>(std::floor(minimum_height *
+                                    static_cast<float>(n_ - 1))),
+        0, n_ - 1);
+    const int maximum_z = std::clamp(
+        static_cast<int>(std::ceil(maximum_height *
+                                   static_cast<float>(n_ - 1))),
+        minimum_z, n_ - 1);
+    SimulationStats stats{};
+    stats.minimum = std::numeric_limits<float>::max();
+    stats.maximum = std::numeric_limits<float>::lowest();
+    double sum = 0.0;
+    std::size_t sample_count = 0U;
+    for (int z = minimum_z; z <= maximum_z; ++z) {
+      for (int y = 0; y < n_; ++y) {
+        for (int x = 0; x < n_; ++x) {
+          const float value = cloud_[index(x, y, z)];
+          stats.minimum = std::min(stats.minimum, value);
+          stats.maximum = std::max(stats.maximum, value);
+          sum += value;
+          ++sample_count;
+        }
+      }
+    }
+    stats.mean = sample_count > 0U
+                     ? static_cast<float>(sum /
+                                          static_cast<double>(sample_count))
+                     : 0.0f;
     return stats;
   }
 
@@ -592,6 +693,28 @@ private:
   static float smoothUnit(float value) {
     value = std::clamp(value, 0.0f, 1.0f);
     return value * value * (3.0f - 2.0f * value);
+  }
+
+  static std::uint32_t mixSourceBits(std::uint32_t value) {
+    value ^= value >> 16U;
+    value *= 0x7feb352dU;
+    value ^= value >> 15U;
+    value *= 0x846ca68bU;
+    value ^= value >> 16U;
+    return value;
+  }
+
+  float sourceRandomUnit(std::size_t layer_index,
+                         std::size_t source_index,
+                         std::uint32_t salt,
+                         std::uint32_t lifecycle_epoch = 0U) const {
+    const std::uint32_t bits = mixSourceBits(
+        static_cast<std::uint32_t>(layer_index + 1U) * 0x9e3779b9U ^
+        static_cast<std::uint32_t>(source_index + 1U) * 0x85ebca6bU ^
+        salt * 0xc2b2ae35U ^ lifecycle_epoch * 0x27d4eb2dU ^
+        environmental_forcing_.spatial_seed * 0x165667b1U);
+    return static_cast<float>(bits >> 8U) /
+           static_cast<float>(1U << 24U);
   }
 
   static float layerSupportAtHeight(const CloudForcing &forcing,
@@ -1299,11 +1422,33 @@ private:
     const float source_normalization =
         1.0f / std::sqrt(std::max(1.0f, total_layer_coverage));
 
+    // Keep multi-layer authoring predictable on the CPU reference solver.
+    // Coverage-proportional quotas distribute at most 32 analytic emitters
+    // across all active layers; high, low-coverage layers still retain two
+    // emitters for spatial variation without multiplying worst-case work by
+    // four when every SKC1 slot is enabled.
+    constexpr std::size_t total_source_budget = 32U;
+    std::size_t remaining_source_budget = total_source_budget;
+    std::size_t remaining_active_layers = 0U;
+    for (std::size_t layer_index = 0;
+         layer_index < environmental_forcing_.cloud_layer_count;
+         ++layer_index) {
+      if (environmental_forcing_.cloud_layers[layer_index].coverage > 0.0f) {
+        ++remaining_active_layers;
+      }
+    }
+
     for (std::size_t layer_index = 0;
          layer_index < environmental_forcing_.cloud_layer_count;
          ++layer_index) {
       const CloudForcingLayer &layer =
           environmental_forcing_.cloud_layers[layer_index];
+      const float layer_coverage =
+          std::clamp(layer.coverage, 0.0f, 1.0f);
+      if (layer_coverage <= 0.0f) {
+        continue;
+      }
+      --remaining_active_layers;
       float center_fraction = 0.35f;
       float thermal_factor = 0.25f;
       float vapor_factor = 0.90f;
@@ -1335,69 +1480,527 @@ private:
       const float normalized_center =
           layer.normalized_base +
           (layer.normalized_top - layer.normalized_base) * center_fraction;
+      const bool is_convective =
+          layer.kind == CloudForcingLayerKind::Convective;
+      int sources_at_full_coverage = 32;
+      int minimum_source_count = 4;
+      float vertical_radius_fraction = 0.27f;
+      float footprint_realization_compensation = 1.44f;
+      switch (layer.kind) {
+      case CloudForcingLayerKind::Convective:
+        // Fewer, differently sized cells form recognizable cloud families;
+        // coverage grows their aggregate footprint instead of filling the
+        // domain with dozens of near-identical puffs.
+        sources_at_full_coverage = 20;
+        break;
+      case CloudForcingLayerKind::Stratiform:
+        sources_at_full_coverage = 14;
+        minimum_source_count = 3;
+        vertical_radius_fraction = 0.20f;
+        footprint_realization_compensation = 1.20f;
+        break;
+      case CloudForcingLayerKind::Cirrus:
+        sources_at_full_coverage = 18;
+        minimum_source_count = 4;
+        vertical_radius_fraction = 0.075f;
+        footprint_realization_compensation = 1.08f;
+        break;
+      case CloudForcingLayerKind::Fog:
+        sources_at_full_coverage = 9;
+        minimum_source_count = 2;
+        vertical_radius_fraction = 0.14f;
+        footprint_realization_compensation = 1.30f;
+        break;
+      }
+      const int requested_source_count = static_cast<int>(std::ceil(
+          layer_coverage * static_cast<float>(sources_at_full_coverage)));
+      const int resolution_source_limit =
+          std::clamp(n_ / 3, 4, static_cast<int>(kMaximumLayerSources));
+      const int proportional_source_share = static_cast<int>(std::lround(
+          static_cast<float>(total_source_budget) * layer_coverage /
+          std::max(0.0001f, total_layer_coverage)));
+      const std::size_t reserved_for_later_layers =
+          std::min(remaining_source_budget,
+                   remaining_active_layers * 2U);
+      const int available_source_limit = static_cast<int>(
+          std::max<std::size_t>(1U, remaining_source_budget -
+                                       reserved_for_later_layers));
+      const int budgeted_source_count = std::clamp(
+          std::min(requested_source_count,
+                   std::max(minimum_source_count,
+                            proportional_source_share)),
+          1, available_source_limit);
+      const std::size_t source_count = static_cast<std::size_t>(std::min(
+          resolution_source_limit,
+          std::min(static_cast<int>(kMaximumLayerSources),
+                   budgeted_source_count)));
+      remaining_source_budget -=
+          std::min(remaining_source_budget, source_count);
       const SimulationVector source_wind =
           sampleWindProfile(environmental_forcing_, normalized_center);
-      layer_source_x_cells_[layer_index] = wrapHorizontalCoordinate(
-          layer_source_x_cells_[layer_index] + source_wind.x * dt);
-      layer_source_y_cells_[layer_index] = wrapHorizontalCoordinate(
-          layer_source_y_cells_[layer_index] + source_wind.y * dt);
-      const float cx = layer_source_x_cells_[layer_index];
-      const float cy = layer_source_y_cells_[layer_index];
-      const float cz =
+      for (std::size_t source_index = 0;
+           source_index < kMaximumLayerSources; ++source_index) {
+        layer_source_x_cells_[layer_index][source_index] =
+            wrapHorizontalCoordinate(
+                layer_source_x_cells_[layer_index][source_index] +
+                source_wind.x * dt);
+        layer_source_y_cells_[layer_index][source_index] =
+            wrapHorizontalCoordinate(
+                layer_source_y_cells_[layer_index][source_index] +
+                source_wind.y * dt);
+      }
+      const float base_cz =
           normalized_center * static_cast<float>(n_ - 1);
-      const float horizontal_radius = std::max(
-          2.0f, static_cast<float>(n_) *
-                    (0.055f + 0.070f * std::sqrt(layer.coverage)));
-      const float vertical_radius = std::clamp(
-          (layer.normalized_top - layer.normalized_base) *
-              static_cast<float>(n_ - 1) * 0.35f,
-          1.5f, static_cast<float>(n_) * 0.16f);
+      const float layer_base_cells =
+          layer.normalized_base * static_cast<float>(n_ - 1);
+      const float layer_top_cells =
+          layer.normalized_top * static_cast<float>(n_ - 1);
+      const float layer_thickness_cells =
+          std::max(0.25f, layer_top_cells - layer_base_cells);
+      const float base_vertical_radius_limit =
+          std::max(0.30f,
+                   std::min(static_cast<float>(n_) * 0.16f,
+                            layer_thickness_cells * 0.46f));
+      const float base_vertical_radius = std::clamp(
+          layer_thickness_cells * vertical_radius_fraction,
+          std::min(0.55f, base_vertical_radius_limit),
+          base_vertical_radius_limit);
       const float optical_strength =
           1.0f - std::exp(-layer.optical_depth / 24.0f);
       const float source_strength =
-          std::sqrt(layer.coverage) *
+          std::sqrt(layer_coverage) *
           (0.45f + 1.05f * optical_strength) * source_normalization;
-      const float inverse_horizontal_radius_squared =
-          1.0f / (horizontal_radius * horizontal_radius);
-      const int min_x =
-          static_cast<int>(std::floor(cx - horizontal_radius));
-      const int max_x =
-          static_cast<int>(std::ceil(cx + horizontal_radius));
-      const int min_y =
-          static_cast<int>(std::floor(cy - horizontal_radius));
-      const int max_y =
-          static_cast<int>(std::ceil(cy + horizontal_radius));
-      const int min_z = std::max(
-          1, static_cast<int>(std::floor(cz - vertical_radius)));
-      const int max_z = std::min(
-          n_ - 2, static_cast<int>(std::ceil(cz + vertical_radius)));
-      for (int z = min_z; z <= max_z; ++z) {
-        for (int y = min_y; y <= max_y; ++y) {
-          for (int x = min_x; x <= max_x; ++x) {
-            const float dx = static_cast<float>(x) - cx;
-            const float dy = static_cast<float>(y) - cy;
-            const float dz = (static_cast<float>(z) - cz) *
-                             horizontal_radius / vertical_radius;
-            const float r2 = (dx * dx + dy * dy + dz * dz) *
-                             inverse_horizontal_radius_squared;
-            if (r2 > 1.0f) {
-              continue;
+      constexpr std::array<float, kMaximumLayerSources>
+          source_radius_multipliers{{
+              1.75f, 0.42f, 1.18f, 0.67f, 2.20f, 0.36f, 0.90f, 1.45f,
+              0.55f, 1.85f, 0.46f, 1.05f, 0.73f, 2.38f, 0.40f, 1.28f,
+              0.61f, 1.58f, 0.34f, 0.98f, 0.50f, 1.96f, 0.79f, 1.12f,
+          }};
+      constexpr std::array<float, kMaximumLayerSources>
+          source_strength_multipliers{{
+              1.18f, 0.78f, 1.04f, 0.86f, 1.26f, 0.72f, 0.96f, 1.12f,
+              0.82f, 1.22f, 0.76f, 1.00f, 0.88f, 1.30f, 0.74f, 1.10f,
+              0.84f, 1.16f, 0.70f, 0.98f, 0.80f, 1.24f, 0.90f, 1.06f,
+          }};
+      constexpr std::array<float, kMaximumLayerSources>
+          source_vertical_offsets{{
+              0.00f, 0.28f, -0.18f, 0.12f, 0.34f, -0.24f, 0.06f, 0.22f,
+              -0.14f, 0.30f, -0.04f, 0.16f, -0.20f, 0.25f, -0.09f, 0.10f,
+              0.31f, -0.27f, 0.04f, 0.19f, -0.12f, 0.27f, -0.06f, 0.14f,
+          }};
+      constexpr std::array<float, kMaximumLayerSources>
+          source_vertical_multipliers{{
+              1.05f, 0.85f, 1.40f, 0.95f, 1.25f, 0.80f, 1.05f, 1.45f,
+              0.90f, 0.75f, 1.60f, 1.10f, 1.15f, 0.82f, 1.35f, 0.92f,
+              1.20f, 0.78f, 1.30f, 1.00f, 0.88f, 1.18f, 0.96f, 1.48f,
+          }};
+
+      struct ConvectiveBillow {
+        float offset_x;
+        float offset_y;
+        float offset_z;
+        float radius_x;
+        float radius_y;
+        float radius_z;
+        float strength;
+      };
+      // A cumulus source is a connected family of compact ellipsoids rather
+      // than one smooth oval. The broad, flattened foundation keeps the
+      // requested projected coverage, the overlapping shoulders make a
+      // scalloped perimeter, and the two smaller upper lobes form a turret.
+      // Offsets and radii are fractions of the source's coverage-sized bounds.
+      constexpr std::array<ConvectiveBillow, 7> convective_billows{{
+          {0.00f, -0.03f, -0.26f, 0.88f, 0.82f, 0.34f, 0.82f},
+          {-0.31f, 0.08f, 0.00f, 0.66f, 0.58f, 0.48f, 0.92f},
+          {0.29f, 0.05f, 0.09f, 0.68f, 0.62f, 0.53f, 1.00f},
+          {0.03f, 0.31f, 0.00f, 0.54f, 0.58f, 0.44f, 0.80f},
+          {-0.03f, -0.29f, 0.15f, 0.59f, 0.61f, 0.52f, 0.88f},
+          {-0.11f, 0.06f, 0.45f, 0.49f, 0.47f, 0.43f, 1.08f},
+          {0.12f, -0.04f, 0.70f, 0.39f, 0.42f, 0.28f, 0.95f},
+      }};
+
+      // Match the aggregate deterministic emitter area to the requested
+      // coverage for every layer kind. Stratiform, cirrus and fog therefore
+      // span the periodic domain with several independently evolving patches
+      // rather than degenerating into one domain-centred ellipsoid.
+      float radius_multiplier_area = 0.0f;
+      for (std::size_t source_index = 0; source_index < source_count;
+           ++source_index) {
+        const float multiplier = source_radius_multipliers[source_index];
+        radius_multiplier_area += multiplier * multiplier;
+      }
+      constexpr float pi = 3.14159265358979323846f;
+      const float target_horizontal_area =
+          std::clamp(layer_coverage * footprint_realization_compensation,
+                     0.0f, 1.0f) *
+          static_cast<float>(n_ * n_);
+      const float base_horizontal_radius = std::clamp(
+          std::sqrt(target_horizontal_area /
+                    (pi * std::max(0.000001f, radius_multiplier_area))),
+          0.75f, static_cast<float>(n_) * 0.22f);
+
+      std::array<float, kMaximumLayerSources> horizontal_radii{};
+      float integrated_weight = 0.0f;
+      for (std::size_t source_index = 0; source_index < source_count;
+           ++source_index) {
+        const float radius_multiplier =
+            source_radius_multipliers[source_index];
+        const float strength_multiplier =
+            source_strength_multipliers[source_index];
+        const float horizontal_radius =
+            std::max(0.85f, base_horizontal_radius * radius_multiplier);
+        horizontal_radii[source_index] = horizontal_radius;
+        integrated_weight +=
+            horizontal_radius * horizontal_radius * strength_multiplier /
+            (base_horizontal_radius * base_horizontal_radius);
+      }
+      // Full-size footprints need more total forcing than one legacy emitter,
+      // but dividing by every source would make each cloud centre collapse.
+      // Square-root normalization keeps centre strength close to the previous
+      // quarter-power-radius implementation while growing total forcing only
+      // with sqrt(source_count), rather than linearly.
+      const float injection_normalization =
+          1.0f / std::sqrt(std::max(1.0f, integrated_weight));
+
+      for (std::size_t source_index = 0; source_index < source_count;
+           ++source_index) {
+        float lifetime_base_seconds = 105.0f;
+        switch (layer.kind) {
+        case CloudForcingLayerKind::Convective:
+          lifetime_base_seconds = 105.0f;
+          break;
+        case CloudForcingLayerKind::Stratiform:
+          lifetime_base_seconds = 360.0f;
+          break;
+        case CloudForcingLayerKind::Cirrus:
+          lifetime_base_seconds = 540.0f;
+          break;
+        case CloudForcingLayerKind::Fog:
+          lifetime_base_seconds = 240.0f;
+          break;
+        }
+        const float lifetime_seconds = lifetime_base_seconds *
+            (0.72f + 0.56f *
+                         sourceRandomUnit(layer_index, source_index, 1U));
+        const double lifecycle_cycles =
+            time_ / static_cast<double>(lifetime_seconds) +
+            static_cast<double>(
+                sourceRandomUnit(layer_index, source_index, 2U));
+        const double lifecycle_epoch_value = std::floor(lifecycle_cycles);
+        const std::uint32_t lifecycle_epoch = static_cast<std::uint32_t>(
+            static_cast<std::uint64_t>(std::max(0.0, lifecycle_epoch_value)) &
+            0xffffffffULL);
+        const float lifecycle_phase = static_cast<float>(
+            lifecycle_cycles - lifecycle_epoch_value);
+        const float lifecycle_growth =
+            smoothUnit(lifecycle_phase / 0.20f);
+        const float lifecycle_decay =
+            1.0f - smoothUnit((lifecycle_phase - 0.70f) / 0.30f);
+        const float lifecycle = lifecycle_growth * lifecycle_decay;
+
+        // Re-seed a source's local birthplace only while its forcing envelope
+        // is at zero. Old condensate then drifts and evaporates while a new,
+        // differently sized cell develops elsewhere, producing actual cloud
+        // birth/death rather than a permanently translated stamp.
+        const float birthplace_radius = static_cast<float>(n_) * 0.10f;
+        const float birthplace_x =
+            (sourceRandomUnit(layer_index, source_index, 3U,
+                              lifecycle_epoch) -
+             0.5f) *
+            2.0f * birthplace_radius;
+        const float birthplace_y =
+            (sourceRandomUnit(layer_index, source_index, 4U,
+                              lifecycle_epoch) -
+             0.5f) *
+            2.0f * birthplace_radius;
+        const float cx = wrapHorizontalCoordinate(
+            layer_source_x_cells_[layer_index][source_index] +
+            birthplace_x);
+        const float cy = wrapHorizontalCoordinate(
+            layer_source_y_cells_[layer_index][source_index] +
+            birthplace_y);
+        const float lifecycle_size_variation =
+            0.78f + 0.44f * sourceRandomUnit(
+                                layer_index, source_index, 21U,
+                                lifecycle_epoch);
+        const float horizontal_radius =
+            horizontal_radii[source_index] * lifecycle_size_variation *
+            (0.68f + 0.42f * lifecycle);
+        const float maximum_vertical_radius =
+            std::max(0.30f, std::min(static_cast<float>(n_) * 0.18f,
+                                    layer_thickness_cells * 0.46f));
+        const float source_vertical_radius = std::clamp(
+            base_vertical_radius * source_vertical_multipliers[source_index] *
+                (0.70f + 0.45f * lifecycle),
+            std::min(0.55f, maximum_vertical_radius),
+            maximum_vertical_radius);
+        const float vertical_wander =
+            std::sin(static_cast<float>(time_) /
+                         (lifetime_seconds * 0.67f) +
+                     6.2831853f *
+                         sourceRandomUnit(layer_index, source_index, 5U));
+        float cz =
+            base_cz + source_vertical_offsets[source_index] *
+                          layer_thickness_cells * 0.38f +
+            vertical_wander * layer_thickness_cells * 0.07f;
+        const float minimum_center =
+            std::max(1.0f, layer_base_cells + source_vertical_radius);
+        const float maximum_center = std::min(
+            static_cast<float>(n_ - 2),
+            layer_top_cells - source_vertical_radius);
+        cz = minimum_center <= maximum_center
+                 ? std::clamp(cz, minimum_center, maximum_center)
+                 : std::clamp(0.5f * (layer_base_cells + layer_top_cells),
+                              1.0f, static_cast<float>(n_ - 2));
+        const float strength_multiplier =
+            source_strength_multipliers[source_index] *
+            (1.45f * lifecycle);
+
+        float horizontal_aspect = 1.0f;
+        float orientation_jitter = 3.14159265f;
+        switch (layer.kind) {
+        case CloudForcingLayerKind::Convective:
+          break;
+        case CloudForcingLayerKind::Stratiform:
+          horizontal_aspect =
+              1.6f + 1.8f *
+                         sourceRandomUnit(layer_index, source_index, 6U);
+          orientation_jitter = 0.80f;
+          break;
+        case CloudForcingLayerKind::Cirrus:
+          horizontal_aspect =
+              3.2f + 2.8f *
+                         sourceRandomUnit(layer_index, source_index, 6U);
+          orientation_jitter = 0.36f;
+          break;
+        case CloudForcingLayerKind::Fog:
+          horizontal_aspect =
+              1.3f + 1.3f *
+                         sourceRandomUnit(layer_index, source_index, 6U);
+          orientation_jitter = 1.20f;
+          break;
+        }
+        const float aspect_root = std::sqrt(horizontal_aspect);
+        const float long_radius = horizontal_radius * aspect_root;
+        const float short_radius = horizontal_radius / aspect_root;
+        const float wind_angle =
+            std::atan2(source_wind.y, source_wind.x);
+        const float billow_angle =
+            is_convective
+                ? static_cast<float>(source_index) * 2.39996323f +
+                      static_cast<float>(layer_index) * 0.731f
+                : wind_angle +
+                      (sourceRandomUnit(layer_index, source_index, 7U) -
+                       0.5f) *
+                          2.0f * orientation_jitter +
+                      0.08f * vertical_wander;
+        const float billow_cosine = std::cos(billow_angle);
+        const float billow_sine = std::sin(billow_angle);
+        std::array<ConvectiveBillow, convective_billows.size()>
+            source_billows = convective_billows;
+        if (is_convective) {
+          // Rotation and uniform scale still read as the same seven-lobe
+          // stamp. Perturb every lobe per source and per lifecycle while it is
+          // hidden, so neighbouring cloud-family members develop genuinely
+          // different shoulders, bases and turret heights.
+          for (std::size_t billow_index = 0;
+               billow_index < source_billows.size(); ++billow_index) {
+            ConvectiveBillow &billow = source_billows[billow_index];
+            const std::uint32_t salt =
+                24U + static_cast<std::uint32_t>(billow_index) * 5U;
+            billow.offset_x +=
+                (sourceRandomUnit(layer_index, source_index, salt,
+                                  lifecycle_epoch) -
+                 0.5f) *
+                0.16f;
+            billow.offset_y +=
+                (sourceRandomUnit(layer_index, source_index, salt + 1U,
+                                  lifecycle_epoch) -
+                 0.5f) *
+                0.16f;
+            billow.offset_z +=
+                (sourceRandomUnit(layer_index, source_index, salt + 2U,
+                                  lifecycle_epoch) -
+                 0.5f) *
+                0.12f;
+            const float horizontal_shape_scale =
+                0.76f + 0.50f * sourceRandomUnit(
+                                    layer_index, source_index, salt + 3U,
+                                    lifecycle_epoch);
+            billow.radius_x *= horizontal_shape_scale;
+            billow.radius_y *=
+                0.76f + 0.50f * sourceRandomUnit(
+                                    layer_index, source_index, salt + 4U,
+                                    lifecycle_epoch);
+            billow.radius_z *=
+                0.70f + 0.68f * sourceRandomUnit(
+                                    layer_index, source_index, salt + 9U,
+                                    lifecycle_epoch);
+            billow.strength *=
+                0.74f + 0.52f * sourceRandomUnit(
+                                    layer_index, source_index, salt + 14U,
+                                    lifecycle_epoch);
+          }
+        }
+        const float horizontal_support_radius =
+            is_convective ? 1.38f * horizontal_radius
+                          : 1.28f * std::max(long_radius, short_radius);
+        const int min_x =
+            static_cast<int>(std::floor(cx - horizontal_support_radius));
+        const int max_x =
+            static_cast<int>(std::ceil(cx + horizontal_support_radius));
+        const int min_y =
+            static_cast<int>(std::floor(cy - horizontal_support_radius));
+        const int max_y =
+            static_cast<int>(std::ceil(cy + horizontal_support_radius));
+        const int min_z = std::max(
+            1, static_cast<int>(std::floor(cz - source_vertical_radius)));
+        const int max_z = std::min(
+            n_ - 2,
+            static_cast<int>(std::ceil(cz + source_vertical_radius)));
+        for (int z = min_z; z <= max_z; ++z) {
+          for (int y = min_y; y <= max_y; ++y) {
+            for (int x = min_x; x <= max_x; ++x) {
+              const float dx = static_cast<float>(x) - cx;
+              const float dy = static_cast<float>(y) - cy;
+              const float dz = static_cast<float>(z) - cz;
+              float shape_weight = 0.0f;
+              if (is_convective) {
+                // Give every physical cloud group a different deterministic
+                // horizontal orientation while keeping its lobes connected.
+                const float local_x =
+                    billow_cosine * dx + billow_sine * dy;
+                const float local_y =
+                    -billow_sine * dx + billow_cosine * dy;
+                for (const ConvectiveBillow &billow : source_billows) {
+                  const float normalized_x =
+                      (local_x - billow.offset_x * horizontal_radius) /
+                      (billow.radius_x * horizontal_radius);
+                  const float normalized_y =
+                      (local_y - billow.offset_y * horizontal_radius) /
+                      (billow.radius_y * horizontal_radius);
+                  const float normalized_z =
+                      (dz - billow.offset_z * source_vertical_radius) /
+                      (billow.radius_z * source_vertical_radius);
+                  const float billow_r2 =
+                      normalized_x * normalized_x +
+                      normalized_y * normalized_y +
+                      normalized_z * normalized_z;
+                  if (billow_r2 <= 1.0f) {
+                    // A cubic smooth edge reaches zero with a zero first
+                    // derivative. This avoids a one-voxel crease when a
+                    // compact billow is reconstructed by the renderer.
+                    const float edge_weight = smoothUnit(1.0f - billow_r2);
+                    const float billow_weight =
+                        billow.strength * std::exp(-3.0f * billow_r2) *
+                        edge_weight;
+                    shape_weight = std::max(shape_weight, billow_weight);
+                  }
+                }
+              } else {
+                const float local_x =
+                    billow_cosine * dx + billow_sine * dy;
+                const float local_y =
+                    -billow_sine * dx + billow_cosine * dy;
+                const auto ellipsoid_weight =
+                    [&](float offset_x, float offset_y, float offset_z,
+                        float radius_x, float radius_y, float radius_z,
+                        float strength) {
+                      const float normalized_x =
+                          (local_x - offset_x) / std::max(0.20f, radius_x);
+                      const float normalized_y =
+                          (local_y - offset_y) / std::max(0.20f, radius_y);
+                      const float normalized_z =
+                          (dz - offset_z) / std::max(0.20f, radius_z);
+                      const float radius_squared =
+                          normalized_x * normalized_x +
+                          normalized_y * normalized_y +
+                          normalized_z * normalized_z;
+                      return radius_squared <= 1.0f
+                                 ? strength * std::exp(-3.0f *
+                                                       radius_squared) *
+                                       smoothUnit(1.0f - radius_squared)
+                                 : 0.0f;
+                    };
+                shape_weight = ellipsoid_weight(
+                    0.0f, 0.0f, 0.0f, long_radius, short_radius,
+                    source_vertical_radius, 1.0f);
+                switch (layer.kind) {
+                case CloudForcingLayerKind::Stratiform:
+                  shape_weight = std::max(
+                      {shape_weight,
+                       ellipsoid_weight(
+                           0.43f * long_radius, 0.18f * short_radius,
+                           0.08f * source_vertical_radius,
+                           0.68f * long_radius, 0.78f * short_radius,
+                           0.76f * source_vertical_radius, 0.82f),
+                       ellipsoid_weight(
+                           -0.39f * long_radius, -0.22f * short_radius,
+                           -0.10f * source_vertical_radius,
+                           0.72f * long_radius, 0.70f * short_radius,
+                           0.82f * source_vertical_radius, 0.76f)});
+                  break;
+                case CloudForcingLayerKind::Cirrus:
+                  shape_weight = std::max(
+                      {shape_weight,
+                       ellipsoid_weight(
+                           -0.18f * long_radius, 0.78f * short_radius,
+                           0.16f * source_vertical_radius,
+                           0.78f * long_radius, 0.42f * short_radius,
+                           0.62f * source_vertical_radius, 0.74f),
+                       ellipsoid_weight(
+                           0.24f * long_radius, -0.72f * short_radius,
+                           -0.12f * source_vertical_radius,
+                           0.66f * long_radius, 0.36f * short_radius,
+                           0.56f * source_vertical_radius, 0.66f)});
+                  break;
+                case CloudForcingLayerKind::Fog:
+                  shape_weight = std::max(
+                      {shape_weight,
+                       ellipsoid_weight(
+                           0.35f * long_radius, -0.10f * short_radius,
+                           -0.12f * source_vertical_radius,
+                           0.78f * long_radius, 0.86f * short_radius,
+                           0.70f * source_vertical_radius, 0.88f),
+                       ellipsoid_weight(
+                           -0.32f * long_radius, 0.12f * short_radius,
+                           0.08f * source_vertical_radius,
+                           0.74f * long_radius, 0.82f * short_radius,
+                           0.74f * source_vertical_radius, 0.84f)});
+                  break;
+                case CloudForcingLayerKind::Convective:
+                  break;
+                }
+                // Slowly moving edge modulation prevents long sheets from
+                // reading as mathematically perfect ellipses at the horizon.
+                const float edge_variation =
+                    0.88f + 0.12f *
+                                std::sin(local_x * 0.63f +
+                                         local_y * 0.41f +
+                                         static_cast<float>(time_) * 0.037f +
+                                         static_cast<float>(source_index));
+                shape_weight *= edge_variation;
+              }
+              if (shape_weight <= 0.0f) {
+                continue;
+              }
+              const float weight =
+                  source_strength * strength_multiplier *
+                  injection_normalization * shape_weight;
+              const std::size_t i = index(x, y, z);
+              if (solid_mask_[i] != 0U) {
+                continue;
+              }
+              temperature_[i] +=
+                  dt * 0.85f * weight * thermal_factor *
+                  environmental_forcing_.thermal_source_multiplier;
+              vapor_[i] += dt * 2.2f * weight * vapor_factor *
+                           environmental_forcing_.vapor_source_multiplier;
+              w_[i] +=
+                  dt * weight * updraft_factor *
+                  environmental_forcing_
+                      .updraft_acceleration_cells_per_second_squared;
             }
-            const float weight =
-                source_strength * std::exp(-3.0f * r2) * (1.0f - r2);
-            const std::size_t i = index(x, y, z);
-            if (solid_mask_[i] != 0U) {
-              continue;
-            }
-            temperature_[i] +=
-                dt * 0.85f * weight * thermal_factor *
-                environmental_forcing_.thermal_source_multiplier;
-            vapor_[i] += dt * 2.2f * weight * vapor_factor *
-                         environmental_forcing_.vapor_source_multiplier;
-            w_[i] +=
-                dt * weight * updraft_factor *
-                environmental_forcing_
-                    .updraft_acceleration_cells_per_second_squared;
           }
         }
       }
@@ -2043,10 +2646,12 @@ private:
               (environmental_forcing_.top_vapor_target -
                environmental_forcing_.surface_vapor_target) *
                   normalized_height;
+          // Layer metadata is a vertical envelope, not a horizontally
+          // uniform cloud source. Keeping this target safely sub-saturated
+          // lets the spatial emitters above determine authored coverage and
+          // prevents a flat condensate sheet across an entire XY plane.
           const float vapor_target =
-              background_vapor_target *
-                  (0.20f + 0.80f * layer_support) +
-              0.08f * layer_support;
+              background_vapor_target * (0.20f + 0.30f * layer_support);
           temperature_[i] -= dt *
                              environmental_forcing_.lapse_cooling_per_second *
                              normalized_height;
@@ -2191,8 +2796,11 @@ private:
   std::vector<std::uint8_t> scalar_touched_mask_;
   std::vector<std::size_t> scalar_touched_indices_;
   std::vector<CloudInteractor> interactors_;
-  std::array<float, 4> layer_source_x_cells_{};
-  std::array<float, 4> layer_source_y_cells_{};
+  static constexpr std::size_t kMaximumLayerSources = 24U;
+  std::array<std::array<float, kMaximumLayerSources>, 4>
+      layer_source_x_cells_{};
+  std::array<std::array<float, kMaximumLayerSources>, 4>
+      layer_source_y_cells_{};
   CloudForcing environmental_forcing_{};
   InteractionStats interaction_stats_;
   std::size_t interaction_cell_budget_ = 0;
