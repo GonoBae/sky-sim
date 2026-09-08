@@ -1,185 +1,121 @@
-# 구현 현황 및 검증 기록
+# 구현 현황
 
-기준일: 2026-08-28
+기준일: 2026-09-08
 
-이 문서는 서버 기반 SkySim을 Unreal Engine 5.6에서 직접 편집·프리뷰할 수 있도록 확장한
-변경 세트를 요약합니다. 프로토콜의 wire 상세는 각 전용 문서, 실제 조작법은
-[Unreal Editor 사용 가이드](unreal-editor-guide.md)를 참고하십시오.
+현재 코드의 구현 범위와 검증 결과를 정리한다. 실행 방법은
+[Unreal 사용 가이드](unreal-editor-guide.md), 남은 작업 순서는
+[개발 일정](development-schedule.md)을 참고한다.
 
-## 완료된 서버 변경
+## 구현된 범위
 
-### 시간·날씨
+| 구분 | 현재 동작 |
+|---|---|
+| 서버 | 3D 구름 밀도·바람·온도·수증기를 계산하고 UDP로 전송 |
+| 시간·천체 | 날짜·위치에 따른 태양·달 계산, 시간 배속·정지·역방향 진행 |
+| 날씨 | 프리셋, seed 기반 Natural Weather, 사용자 지정 값과 최대 4개 구름층 |
+| Unreal | 에디터 프리뷰·Play, 하늘 조명·안개·구름 렌더링, Spectator 자유 비행 |
+| 구름 표시 | 밀도 프레임 보간, 평균 수평 바람 보정, 고정 기준 밀도 변환 |
+| 실시간 제어 | 시간·위치·날씨·구름층 변경, 응답 확인·재전송, 재연결 |
+| 물체 영향 | 서버의 CLC2 처리와 Python 송신 도구. Unreal 전용 컴포넌트는 미구현 |
 
-- `SKS1` 전역 하늘 상태와 `SKC1` 제어를 날짜·위치·time scale, preset/Natural,
-  Advanced Weather와 최대 네 구름층까지 연결했습니다.
-- Natural weather가 UTC의 계절·일주 변화와 여러 synoptic/moisture 주기를 이용해 기온,
-  습도, 시정, 바람, 강수, 대류와 번개를 연속 갱신합니다.
-- 1배속에서는 약 120초 응답으로 부드럽게 변화하고, 가속 시간에서는 최대 48배 응답을
-  사용해 time lapse를 따라갑니다. 정지와 역방향 시간도 처리합니다.
-- 서로 다른 preset/Natural 레이어를 index로 바로 보간하지 않고 종류와 가까운 중심 고도를
-  기준으로 pairing합니다. 새 레이어와 사라지는 레이어는 원래 고도에서 fade합니다.
-- Cumulus, Overcast, Rain과 Snow가 단일 slab가 아니라 저층/중층/상층 조합을 갖습니다.
-  Natural도 조건에 따라 broken lower layer, main deck, middle deck, cirrus/anvil, radiation
-  fog를 함께 만듭니다.
+Natural Weather는 절차 모델이다. 실제 관측이나 예보 자료를 사용하지 않는다.
+비·눈·번개·지면 젖음 등의 상태값은 계산하지만 강수 입자, 번개 형상, 젖은 지면과 적설
+렌더링은 아직 연결하지 않았다.
 
-관련 코드:
+## 구름 수신과 표시
 
-- `src/weather.hpp`
-- `src/environment.hpp`
-- `src/main.cpp` self-test
-- `tests/test_sky_loopback.py`
-- `tests/test_sky_regression_loopback.py`
+9월 8일 수신·전처리·렌더링 경로를 분리하고 움직임 보간을 추가했다.
 
-### 자연스러운 구름 분포
+- `FSkySimVolumeReceiver`: CLD2 검증, chunk 조립, RLE 해제. 여러 필드를 검증할 수 있지만
+  Unreal에 전달하는 결과는 density뿐이다.
+- `FSkySimDensityFrameHistory`: 중복·뒤늦은 프레임 거부, 재연결 시 새 프레임 계열 수용.
+- `FSkySimCloudMotion`: 최대 16개 프레임 보관, 기본 0.30초 지연 재생, 평균 바람 이동량 적분.
+- `FSkySimDensityPresentation`: 밀도 변환·형태 보정·캐시. 같은 프레임과 설정은 재계산하지 않는다.
+- `SkySimSystemRendering.cpp`: GPU 텍스처 두 개를 재사용하고 머티리얼 값을 갱신한다.
 
-- `Weather Seed`를 `CloudForcing::spatial_seed`에 연결했습니다. seed가 바뀌면 기존 field를
-  초기화하고 새로운 cloud-family 공간 배치를 만듭니다.
-- 이전의 균일한 additive-recurrence 점 분포를 세 개의 비등방 cloud family와 일부 위성
-  cloud 구조로 교체했습니다.
-- 단일 레이어 full-coverage emitter 기준을 종류별로 나눴습니다.
-  Convective 20, Stratiform 14, Cirrus 18, Fog 9이며 활성 레이어 전체 예산은 32입니다.
-- source마다 수평 크기, strength, 중심 높이와 수직 반경을 다르게 생성합니다. Convective
-  수평 크기 범위는 대략 0.34~2.38배, 수직 크기는 0.75~1.60배입니다.
-- Convective source는 성장/유지/소멸과 재탄생 생애주기를 가지며 생애마다 위치와 크기가
-  달라집니다.
-- 일곱 billow의 offset, 반경, 높이와 strength를 source/lifecycle seed로 각각 바꿔 동일한
-  도장 모양의 반복을 줄였습니다.
-- Stratiform/Cirrus/Fog는 서로 다른 aspect, 바람 정렬, 추가 lobe와 edge modulation을
-  사용합니다.
-- cloud layer metadata는 수직 envelope로만 사용하고 전체 XY plane을 포화시키지 않도록
-  background vapor target을 sub-saturated로 유지합니다.
+머티리얼은 이전·현재 프레임 각각에서 원본·보조 좌표를 읽어 총 네 번 밀도를 샘플링한다.
+평균 수평 바람으로 두 시점의 좌표를 맞춘 뒤 보간하며, 넓은 구름 분포와 세부 노이즈에도
+누적 이동량을 적용한다. 이동 기준은 UTC가 아닌 CLD2 유체 시각이다.
 
-관련 코드:
+수신 밀도는 프레임별 scale/bias로 복원한 뒤 기본 기준값 8로 나눠 표시한다.
+인코딩 범위 변경에 따른 밝기 출렁임을 줄이지만 기준값을 넘는 밀도는 포화된다.
+이 값은 표시용 설정이며 물리적으로 보정된 소광 계수는 아니다.
 
-- `src/simulation.hpp`
-- `src/environment.hpp`
-- `src/main.cpp`의 density-plane/seed/multilayer 회귀 검사
+수신 중단 시 마지막 상태를 유지한다. 명시적으로 수신을 꺼도 보관한 프레임의 표시 설정을
+바꿀 수 있다. SKS1의 서버 재시작 감지 또는 2초를 넘는 밀도 수신 공백은 새 보간 구간으로
+처리한다. 텍스처 이름 충돌과 그래픽 리소스 준비 전 업로드 재시도도 통합 검사로 확인했다.
 
-## 완료된 Unreal 변경
+좌표·머티리얼 파라미터는 [렌더링 구조](unreal-rendering.md)에 정리한다.
 
-### 프로젝트와 런타임
+## 시간과 에디터 제어
 
-- Unreal Engine 5.6 C++ 프로젝트를 `Unreal/uskysim`에 포함했습니다.
-- `NewWorld`를 editor/game 기본 맵으로 설정했습니다.
-- `ASkySimSystem`이 `CLD2`와 `SKS1` UDP를 non-blocking으로 받고 `SKC1`을 송신합니다.
-- `CLD2`의 크기, chunk 위치, encoding, RLE, field CRC와 frame 완성을 검증합니다.
-- density를 transient `PF_G16` volume texture로 올려
-  `UHeterogeneousVolumeComponent`와 `/Game/SkySim/M_SkySimVolume`으로 표시합니다.
-- `SKS1`에서 태양·달 Directional Light, Sky Light, Sky Atmosphere와 Weather Fog를
-  갱신합니다.
+- 에디터·PIE·Game이 같은 실행 시계를 사용한다. Details의 시작 시각과 현재 진행 시각은 별도다.
+- SKS1 패킷 사이에서도 태양 방향을 갱신한다. 2초 이상 상태가 없으면 마지막 배속으로
+  `server_fallback`을 이어간다.
+- 기본 재연결 동기화가 켜져 있으면 서버 재시작 후 보존한 실행 시각을 다시 적용한다.
+- Details 변경은 짧게 모아 순서대로 전송하고 ACK를 기다린다. PIE 진입 시 에디터가 수신
+  포트를 놓고, 종료 후 다시 연결한다.
+- `Time Scale = 0`은 달력·천체 시각을 멈춘다. 유체 계산과 실제 시간 기준의 날씨 전환·완화,
+  번개·지면 젖음 갱신까지 모두 멈추는 기능은 아니다.
 
-### Editor authoring
+## 남은 작업
 
-- `ShouldTickIfViewportsOnly()`를 사용해 Play 없이 editor viewport에서 프리뷰합니다.
-- PIE 진입 시 editor receiver가 UDP 포트를 놓고, PIE 종료 후 자동 재연결합니다.
-- 날짜·위치·time scale, preset/seed, Advanced Weather와 네 구름층을 Details에서
-  편집합니다.
-- Details 변경은 debounce 후 ACK-serialized queue를 통해 전송합니다.
-- reconnect sync는 날짜·위치·배속·preset을 복원하되 Advanced Weather는 Natural을 수동
-  override하지 않도록 기본 제외합니다.
-- Apply/Pause/Resume, Release Weather To Natural, Apply Custom Weather/Cloud Layers와
-  Request Keyframe 버튼을 제공합니다.
-- 연결, volume frame, density 통계, 서버 시간/위치, control 결과를 Details 상태로
-  표시합니다.
+| 항목 | 현재 한계 |
+|---|---|
+| P0-01 구름 움직임 | 평균 바람 보정까지 구현. voxel별 속도, 고도별 바람 차이, 잔상과 화면 이동 속도 검증은 남음 |
+| P0-02 시간·빛 | 기본 진행·정지·재연결 수정 완료. 무제한 FPS 등 부하별 시계 오차 추가 점검 필요 |
+| P0-03 구름 분포 | 위치·크기·고도는 달라지지만 고정된 세 군집과 기본 lobe 구조를 재사용해 반복이 남음 |
+| P0-04 고고도 경계 | 기본 120km는 전체 폭이며 중앙에서 경계까지 약 60km. 정사각형 외곽과 빈 하늘이 보임 |
 
-관련 코드:
+광역 구름은 20km 기준 밀도장을 반복·변형해 표시한다. 독립된 120km 물리 시뮬레이션이
+아니며, 카메라를 따라 영역을 옮기거나 크기만 늘려서는 고고도 경계 문제가 해결되지 않는다.
 
-- `Unreal/uskysim/Source/uskysim/SkySimSystem.h`
-- `Unreal/uskysim/Source/uskysim/SkySimSystem.cpp`
-- `Unreal/uskysim/Source/uskysimEditor/uskysimEditor.cpp`
+추가로 남은 항목:
 
-### 광역 구름 표현
-
-- 20km reference domain을 기본 120km로 확장하며 tile당 density detail을 유지합니다.
-- 서버의 cloud-family 군집과 별도로 전체 world 기준 regional coverage mask를 사용해 큰
-  청천 통로와 비대칭 front를 만듭니다.
-- weather map의 R/G channel로 primary density 좌표를 warp합니다.
-- 같은 live density를 비정수 scale/offset의 두 번째 좌표로 다시 읽고 regional mask로
-  혼합해 정확한 6×6 복사를 줄입니다.
-- weather-map offset은 UTC와 평균 바람을 따라 움직입니다.
-- detail erosion을 낮은 비정수 tiling과 mip 2로 바꿔 탑뷰의 대각선 comb/moire를
-  완화했습니다.
-- CPU presentation은 spread 0, shape power 0.92, gain 1.20을 기본값으로 사용합니다.
-
-저장 기본값:
-
-| 항목 | 값 |
-|---|---:|
-| Wide world extent | 120km |
-| Regional Clear-Sky Strength | 0.13 |
-| Regional Coverage Scale | (2.15, 1.65, 0.70) |
-| Large-Scale Position Warp | 0.16 |
-| Secondary Pattern Scale | (0.83, 1.137, 1.0) |
-| Secondary Pattern Offset | (0.37, 0.61, 0.0) |
-| Pattern De-Tiling Blend | 0.72 |
-| Detail Erosion Strength | 0.07 |
-| Detail Noise Tiling | (7.13, 5.77, 4.31) |
-
-관련 코드와 자산:
-
-- `Unreal/uskysim/Source/uskysim/SkySimSystem.cpp`
-- `tools/create_unreal_volume_material.py`
-- `Unreal/uskysim/Content/SkySim/M_SkySimVolume.uasset`
-- `tools/configure_unreal_dynamic_sky_defaults.py`
-
-### Spectator
-
-- `ASkySimSpectatorPawn`을 기본 pawn/spectator class로 사용합니다.
-- W/S, A/D, E/Q, Shift boost와 collision 없는 자유 비행을 제공합니다.
-- 마우스를 위로 움직이면 위를 보도록 raw Mouse Y 부호를 수정했습니다.
-- `Invert Mouse Y`는 선택 옵션이며 기본 꺼짐입니다.
-- 기본 FOV 95°, 초기 pitch 14°, 이동 속도 100,000cm/s입니다.
-
-관련 코드:
-
-- `Unreal/uskysim/Source/uskysim/SkySimSpectatorPawn.h`
-- `Unreal/uskysim/Source/uskysim/SkySimSpectatorPawn.cpp`
-- `Unreal/uskysim/Source/uskysim/uskysimGameModeBase.cpp`
-
-## 재현·진단 도구
-
-다음 도구를 저장소에 포함합니다.
-
-- `tools/create_unreal_volume_material.py`: Heterogeneous Volume material graph 재생성
-- `tools/configure_unreal_dynamic_sky_defaults.py`: NewWorld의 권장 기본값 저장
-- `tools/ensure_unreal_preview_start.py`: PlayerStart/Preview Camera 구성
-- `tools/inspect_unreal_level.py`: 맵 액터, transform과 SkySim 속성 출력
-- `tools/inspect_unreal_material.py`: material과 expression 연결 검사
-- `tools/verify_unreal_startup.py`: editor startup material 확인
-- `tools/test_unreal_cloud_authoring_control.py`: 저장 없이 coverage control 왕복
-- `tools/analyze_density_components.py`: raw R16 density 연결 성분 분석
-- `tools/capture_density_projection.py`: live density 탑뷰와 분포 통계 생성
-
-Windows 창 클릭·프로세스 제어 스크립트, 실행 로그와 캡처는 로컬 시각 QA용이며 제품
-소스와 재현 가능한 테스트가 아니므로 Git에서 제외합니다.
+- Weather Fog가 Fog 프리셋 외 날씨에서도 시정·습도에 따라 켜져 지면 연무가 과해질 수 있다.
+- Unreal의 velocity·temperature·vapor·occupancy 활용, 강수·번개 효과와 물체 영향 컴포넌트.
+- 실행 시계·제어 상태와 서버 구름 생성기의 후속 리팩토링.
+- 에디터 실시간 뷰포트 수동 검증, 장시간 운용과 최종 시각 품질 검증.
 
 ## 검증 결과
 
-이 변경 세트에서 확인할 기준은 다음과 같습니다.
+다음은 9월 8일 코드 검증 결과다. 자동화 통과와 화면 품질 승인은 구분한다.
 
-| 검증 | 기대 결과 |
+| 검사 | 결과 |
 |---|---|
-| 서버 `--self-test` | 성공, varied density plane/seed/multilayer 검사 통과 |
-| CTest | 9/9 통과 |
-| Unreal `uskysimEditor` Development build | 성공 |
-| `M_SkySimVolume` commandlet 생성/로드 | 성공 |
-| `NewWorld` Map Check | 0 Error, 0 Warning |
-| runtime `CLD2`/`SKS1` | frame/packet/sky drop 0 |
-| cloud distribution diagnostic | 넓은 clear corridor와 비균일 군집 확인 |
-| PIE Spectator | 6축 이동, Shift boost, 정상 Mouse Y 확인 |
+| UE 5.6 Development 빌드 | 통과 |
+| Unreal 자동화 | D3D12에서 30/30 통과: 단위 29개·렌더링 통합 1개, 실패·경고·미실행 0 |
+| 서버·프로토콜 CTest | 9/9 통과 |
+| 시간 로그 검사 도구 self-test | 통과 |
+| 실제 머티리얼 생성 | version 15 생성·컴파일 통과 |
+| Game 서버 연결 | 60fps 제한·24초 실행. 진단 25개 중 24개에서 두 프레임 사이 보간 확인 |
+| 구름 시계·버퍼 | solver +23.543819초, 시간 역행 없음, 최대 16개 보관 |
+| 60배속 시간·태양 | 인접 11구간 통과, 태양 고도 변화 0.1° 기준 통과. 최대 UTC 오차 1.746 시뮬레이션 초 |
+| 화면 이동 속도·잔상·고고도 경계 | 미검증 또는 미해결. P0 전체 완료 아님 |
 
-검증 명령과 판정 방법은 [Unreal Editor 사용 가이드의 검증 절차](unreal-editor-guide.md#검증-절차)를
-따릅니다.
+렌더링 통합 검사는 텍스처 분리·재사용, 머티리얼 연결, 캐시, 수신 중단 후 설정 변경,
+리소스 재생성 후 업로드 복구와 서버 재시작을 확인한다. 최종 Game·RHI 로그에
+Error, fatal, ensure 항목은 없었다.
 
-## 알려진 제한과 후속 항목
+별도 부하 검사에서는 무제한 FPS Game의 시간 구간 14개 중 4개가 허용 오차를 넘었다.
+숨김 에디터 검사도 뷰포트 Tick이 진행되지 않아 프리뷰 수신 검증을 완료하지 못했다.
+UTC 정지·재개·서버 중단·재시작은 9월 4일 검증 기록이다. 최종 24초 실행에서는
+60배속 진행을 검사했다.
 
-- `SkySimWeatherFog`는 현재 Fog preset뿐 아니라 유효한 시정/습도 값이 있으면 모든 날씨에서
-  켜집니다. 시작 거리 0m라 지면 카메라에서 수평선 연무가 과하게 보일 수 있습니다. 맑은
-  장면 평가 시 Weather Fog를 끄거나 density multiplier를 0으로 두십시오.
-- Unreal은 현재 `CLD2` density만 사용합니다. velocity temporal interpolation,
-  temperature/vapor detail과 occupancy skip은 미구현입니다.
-- Wide Cloud World는 독립 120km 물리 solver가 아니라 20km reference field의 비주기 합성
-  표현입니다.
-- 강수 입자, 번개 bolt/위치, 젖은 지면·적설 feedback은 상태만 있고 renderer는 없습니다.
-- `CLC2` 서버와 참조 도구는 구현됐지만 Unreal `SkySimInteractorComponent`는 아직 없습니다.
-- Natural weather는 실제 관측/예보 동화가 아닌 deterministic procedural model입니다.
+로컬 검증 자료는 다음 위치에 있다. `Unreal/uskysim` 기준이며 Git에는 포함하지 않는다.
+
+- `Saved/Automation/SkySimMotionRHIFinal-20260908/index.json`
+- `Saved/Logs/SkySimMotionRHIFinal-20260908.log`
+- `Saved/Logs/SkySimMotionGameFinal-20260908.log`
+- `Saved/Logs/SkySimMotionMaterial-20260908.log`
+- `Saved/Logs/SkySimRefactorGame-20260908.log` — 무제한 FPS 비교
+
+## 문서
+
+- [Unreal 사용 가이드](unreal-editor-guide.md)
+- [렌더링 구조](unreal-rendering.md)
+- [개발 일정](development-schedule.md)
+- [CLD2 볼륨 프로토콜](protocol-v2.md)
+- [SKS1 하늘 상태](sky-state-protocol.md)
+- [SKC1 시간·날씨 제어](sky-control.md)
+- [CLC2 물체 영향 제어](interactor-control.md)

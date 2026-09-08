@@ -2,6 +2,10 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
+#include "SkySimCloudMotion.h"
+#include "SkySimDensityFrame.h"
+#include "SkySimDensityPresentation.h"
+#include "SkySimVolumeReceiver.h"
 #include "SkySimSystem.generated.h"
 
 class FSocket;
@@ -12,6 +16,22 @@ class USceneComponent;
 class USkyAtmosphereComponent;
 class USkyLightComponent;
 class UVolumeTexture;
+
+struct FSkySimDensityRenderSlot
+{
+	FSkySimDensityPresentation Presentation;
+	double SourceReceiveSeconds = -1.0;
+	double SourceSimulationTime = -1.0;
+	uint32 SourceFrameId = 0;
+	uint64 SourceRevision = 0;
+	uint64 UploadedRevision = 0;
+
+	bool Matches(const FSkySimDensityFrame& Frame) const
+	{
+		return SourceRevision != 0 && SourceFrameId == Frame.FrameId &&
+			SourceSimulationTime == Frame.SimulationTime && SourceReceiveSeconds == Frame.ReceivePlatformSeconds;
+	}
+};
 
 UENUM(BlueprintType)
 enum class ESkySimWeatherPreset : uint8
@@ -148,13 +168,13 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Sky Sim|Editor Preview", meta = (ToolTip = "Receives live server sky and cloud frames in the level-editor viewport without entering Play mode."))
 	bool bPreviewInEditor = true;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Sky Sim|Editor Preview", meta = (EditCondition = "bPreviewInEditor", ToolTip = "When no recent server sky state is available, advances the authored date/time locally so sun movement remains visible in the editor."))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Sky Sim|Editor Preview", meta = (EditCondition = "bPreviewInEditor", ToolTip = "Interpolates time between server packets and, when the server is unavailable, continues from the last effective time so sun movement remains visible in the editor."))
 	bool bAnimateTimeInEditor = true;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Sky Sim|Editor Preview", meta = (EditCondition = "bPreviewInEditor", ToolTip = "Automatically sends edited date, location, time-scale, weather preset, transition and advanced-weather values after a short debounce."))
 	bool bAutoApplySkyControlsInEditor = true;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Sky Sim|Editor Preview", meta = (EditCondition = "bPreviewInEditor", ToolTip = "Makes the placed actor authoritative after a server/editor reconnect by sending date, location, time scale and weather settings through the ACK-serialized control queue."))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Sky Sim|Editor Preview", meta = (EditCondition = "bPreviewInEditor", ToolTip = "Makes the placed actor authoritative on the initial connection and after a detected server restart. A normal socket rebind keeps the current runtime clock instead of resending the static authored start time."))
 	bool bSyncAuthoringSettingsOnConnect = true;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Sky Sim|Editor Preview", meta = (EditCondition = "bSyncAuthoringSettingsOnConnect", AdvancedDisplay, ToolTip = "Also reapplies the Advanced Weather block on connect. This intentionally changes Natural weather to a manual override."))
@@ -246,10 +266,25 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Sky Sim|Rendering|Cloud Presentation", meta = (ClampMin = "0.0", ClampMax = "4.0"))
 	float DensityPresentationGain = 1.20f;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Sky Sim|Rendering|Cloud Presentation", meta = (ToolTip = "Uses the protocol's physical density scale directly. Disabled by default because the simulation density is not calibrated to Unreal inverse-centimetre extinction and otherwise becomes opaque as the field evolves."))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Sky Sim|Rendering|Cloud Presentation", meta = (ToolTip = "Decodes each frame's physical density against a fixed display reference, avoiding brightness changes caused only by network encoding scale."))
+	bool bStabilizeDensityScale = true;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Sky Sim|Rendering|Cloud Presentation", meta = (EditCondition = "bStabilizeDensityScale || bUsePhysicalDensityScaleForRendering", ClampMin = "0.001", ClampMax = "100000.0", UIMin = "1.0", UIMax = "64.0", ToolTip = "Physical density mapped to full displayed density before shaping. Higher values make clouds thinner; values above the reference saturate. Also used as the common reference for physical-scale interpolation. This is a visual control, not calibrated extinction."))
+	float DensityReferenceScale = 8.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Sky Sim|Rendering|Cloud Motion", meta = (ToolTip = "Buffers complete cloud frames and blends them on the GPU in both realtime editor preview and Play."))
+	bool bInterpolateCloudFrames = true;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Sky Sim|Rendering|Cloud Motion", meta = (EditCondition = "bInterpolateCloudFrames", ClampMin = "0.0", ClampMax = "1.0", Units = "s", ToolTip = "Playback delay to absorb network jitter. 0.3 seconds suits a 5 Hz stream; increase for slower streams. A stalled stream holds its final cloud frame."))
+	float CloudInterpolationDelaySeconds = 0.30f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Sky Sim|Rendering|Cloud Motion", meta = (ToolTip = "Uses mean horizontal wind to align interpolation endpoints and advect regional/detail noise. This is an approximation, not full per-voxel velocity reprojection."))
+	bool bUseMeanWindCloudMotion = true;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Sky Sim|Rendering|Cloud Presentation", meta = (ToolTip = "Multiplies shaped display density by Density Reference Scale. Both interpolation endpoints are decoded using that common reference. Disabled by default: these values are not calibrated to Unreal inverse-centimetre extinction and may produce opaque clouds."))
 	bool bUsePhysicalDensityScaleForRendering = false;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Sky Sim|Time and Location", meta = (DisplayName = "Local Date and Time"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Sky Sim|Time and Location", meta = (DisplayName = "Start / Authoring Local Date and Time", ToolTip = "Authored starting time sent to the server. Runtime time is shown in the read-only Runtime Clock category."))
 	FDateTime ControlLocalDateTime = FDateTime(2026, 8, 26, 16, 0, 0);
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Sky Sim|Time and Location", meta = (ClampMin = "-14.0", ClampMax = "14.0"))
@@ -503,6 +538,15 @@ public:
 	UPROPERTY(VisibleAnywhere, Category = "Sky Sim|Volume", Transient)
 	TObjectPtr<UVolumeTexture> DensityVolumeTexture = nullptr;
 
+	UPROPERTY(VisibleAnywhere, Transient, Category = "Sky Sim|Volume")
+	TObjectPtr<UVolumeTexture> PreviousDensityVolumeTexture = nullptr;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Sky Sim|Rendering|Cloud Motion")
+	float CloudFrameBlend = 1.0f;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Sky Sim|Rendering|Cloud Motion")
+	double DisplayedCloudSimulationSeconds = 0.0;
+
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Sky Sim|Weather")
 	double UtcUnixSeconds = 0.0;
 
@@ -532,6 +576,21 @@ public:
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Sky Sim|Server State")
 	float ServerTimeScale = 0.0f;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Sky Sim|Runtime Clock", meta = (DisplayName = "Current UTC Date and Time"))
+	FDateTime CurrentUtcDateTime;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Sky Sim|Runtime Clock", meta = (DisplayName = "Current Local Date and Time"))
+	FDateTime CurrentLocalDateTime;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Sky Sim|Runtime Clock", meta = (DisplayName = "Current Effective Time Scale"))
+	float CurrentEffectiveTimeScale = 0.0f;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Sky Sim|Runtime Clock", meta = (DisplayName = "Clock Source", ToolTip = "server_interpolated, server_fallback, authoring_fallback, server_packet, or editor_paused."))
+	FString RuntimeClockSource = TEXT("authoring_fallback");
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Sky Sim|Runtime Clock", meta = (DisplayName = "Current Sun Elevation", Units = "deg"))
+	float CurrentSunElevationDegrees = 0.0f;
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Sky Sim|Server State")
 	FVector ServerDomainExtentMeters = FVector::ZeroVector;
@@ -566,6 +625,9 @@ protected:
 #endif
 
 private:
+#if WITH_DEV_AUTOMATION_TESTS
+	friend class FSkySimCloudRenderingIntegrationTest;
+#endif
 	UPROPERTY()
 	TObjectPtr<USceneComponent> SceneRoot;
 
@@ -584,6 +646,13 @@ private:
 	double CustomCumulusApplyDuePlatformSeconds = 0.0;
 	bool bSkyControlsApplyScheduled = false;
 	double SkyControlsApplyDuePlatformSeconds = 0.0;
+	bool bUseRuntimeUtcForScheduledSkyControls = false;
+	bool bRuntimeClockResyncPending = false;
+	uint32 RuntimeClockResyncControlSequence = 0;
+	bool bTimeScaleApplyScheduled = false;
+	double TimeScaleApplyDuePlatformSeconds = 0.0;
+	bool bTimeScaleOverridePending = false;
+	uint32 TimeScaleControlSequence = 0;
 	bool bWeatherPresetApplyScheduled = false;
 	double WeatherPresetApplyDuePlatformSeconds = 0.0;
 	bool bCustomWeatherApplyScheduled = false;
@@ -592,48 +661,33 @@ private:
 	double LastSkyStateReceivePlatformSeconds = -1.0;
 	double EditorPreviewUtcUnixSeconds = 0.0;
 	bool bEditorPreviewClockInitialized = false;
+	double RuntimeClockBaseUtcUnixSeconds = 0.0;
+	double RuntimeClockBasePlatformSeconds = -1.0;
+	float RuntimeClockTimeScale = 1.0f;
+	double RuntimeClockLatitudeDegrees = 0.0;
+	double RuntimeClockLongitudeDegrees = 0.0;
+	bool bRuntimeClockHasServerReference = false;
+	double NextRuntimeClockDiagnosticPlatformSeconds = 0.0;
+	uint32 LastAcceptedSkyStateSequence = 0;
+	int32 ConsecutiveBackwardSkyPackets = 0;
 	bool bAwaitingInitialServerSync = true;
 #if WITH_EDITOR
 	bool bEditorReceiverPausedForPIE = false;
 #endif
 
-	struct FVolumeFieldAssembly
-	{
-		FIntVector GridSize = FIntVector::ZeroValue;
-		uint32 FieldCrc32 = 0;
-		uint8 VoxelFormat = 0;
-		uint8 FieldId = 0;
-		uint8 ChannelCount = 0;
-		uint8 Compression = 0;
-		uint16 ChunkCount = 0;
-		uint16 Flags = 0;
-		uint32 EncodedBytes = 0;
-		uint32 DecodedBytes = 0;
-		float ValueScale = 0.0f;
-		float ValueBias = 0.0f;
-		TArray<uint8> Encoded;
-		TArray<uint8> Decoded;
-		TBitArray<> ReceivedChunks;
-		int32 ReceivedChunkCount = 0;
-
-		bool IsComplete() const { return Decoded.Num() == static_cast<int32>(DecodedBytes); }
-	};
-
-	struct FVolumeFrameAssembly
-	{
-		uint32 FrameId = 0;
-		double SimulationTime = 0.0;
-		uint16 FieldMask = 0;
-		double LastReceivedPlatformSeconds = 0.0;
-		TMap<uint8, FVolumeFieldAssembly> Fields;
-	};
-
-	TMap<uint32, FVolumeFrameAssembly> VolumeFrames;
-	TArray<uint8> LatestDensityBytes;
-	TArray<uint8> PresentedDensityBytes;
-	TArray<float> DensityPresentationWorking;
-	TArray<float> DensityPresentationScratchA;
-	TArray<float> DensityPresentationScratchB;
+	FSkySimVolumeReceiver VolumeReceiver;
+	FSkySimDensityFrameHistory DensityFrames;
+	FSkySimCloudMotion CloudMotion;
+	double FrozenCloudPlaybackSeconds = 0.0;
+	FSkySimDensityRenderSlot DensityRenderSlots[2];
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<UVolumeTexture>> DensityTextureSlots;
+	FVector CloudDisplacementMeters = FVector::ZeroVector;
+	FVector PreviousCloudOffset = FVector::ZeroVector;
+	FVector CurrentCloudOffset = FVector::ZeroVector;
+	float DisplayDensityValueScale = 1.0f;
+	float DisplayDensityValueBias = 0.0f;
+	double NextCloudMotionDiagnosticSeconds = 0.0;
 
 	FSocket* CreateBoundSocket(const TCHAR* DebugName, int32 Port) const;
 	bool EnsureControlSocket();
@@ -645,23 +699,30 @@ private:
 	bool SendCloudLayerControl();
 	bool SendCustomWeatherControl();
 	void RefreshEstimatedCloudSourceCount();
-	void ScheduleAuthoringSync();
+	void ScheduleAuthoringSync(bool bPreserveRuntimeUtc = false, double PreservedUtcUnixSeconds = 0.0);
 	void ResetEditorPreviewClock();
-	void UpdatePreviewLightingAtUtc(double PreviewUtcUnix);
+	void RebaseRuntimeClockFromServer(double ServerUtcUnix, float TimeScale, double LatitudeDegrees,
+		double LongitudeDegrees, double ReceivePlatformSeconds);
+	void RebaseRuntimeClockTimeScale(float TimeScale);
+	double EvaluateRuntimeClockUtc(double PlatformSeconds, bool bAdvance) const;
+	void UpdateRuntimeClockAndLighting();
+	FVector UpdateSunRotationAtUtc(double PreviewUtcUnix, double LatitudeDegrees, double LongitudeDegrees);
+	void UpdatePreviewLightingAtUtc(double PreviewUtcUnix, double LatitudeDegrees, double LongitudeDegrees,
+		float FallbackBlend = 1.0f);
 	bool SendPendingControlPacket();
 	void PumpControlRetry();
 	void HandleControlAcknowledgement(uint32 Session, uint32 Sequence, uint8 Result);
 	void DrainSocket(FSocket* Socket, bool bSkyState);
 	bool ParseSkyState(const uint8* Data, int32 NumBytes);
 	bool ParseVolumePacket(const uint8* Data, int32 NumBytes);
-	bool DecodeCompletedField(FVolumeFieldAssembly& Field) const;
-	void PublishCompletedFrame(uint32 FrameId);
-	void BuildPresentedDensityBytes();
-	void UpdateDensityVolumeTexture();
+	void PublishCompletedFrame(FSkySimDensityFrame&& CompletedFrame);
+	void RefreshDensityRendering();
+	bool PrepareDensityRenderSlot(const FSkySimDensityFrame& Frame, int32 SlotIndex);
+	bool UploadPresentedDensity(const FSkySimDensityPresentation& Presentation, TObjectPtr<UVolumeTexture>& Texture);
+	void UpdateCloudMotionMaterialParameters();
 	void UpdateVolumeRenderer();
 	void UpdateEnvironmentLighting();
 	void UpdatePreviewLightingFromControls();
 	void UpdateMoonLighting(const FVector& DirectionEnu, float IlluminanceLux);
 	void UpdateWeatherFog(float InVisibilityMeters, float InRelativeHumidity);
-	void PruneStaleVolumeFrames();
 };

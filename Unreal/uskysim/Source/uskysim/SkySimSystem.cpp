@@ -9,17 +9,11 @@
 #include "Components/SkyLightComponent.h"
 #include "HAL/Platform.h"
 #include "Engine/Engine.h"
-#include "Engine/VolumeTexture.h"
 #include "Interfaces/IPv4/IPv4Address.h"
-#include "Materials/MaterialInstanceDynamic.h"
-#include "Materials/MaterialInterface.h"
 #include "Misc/Crc.h"
 #include "Misc/Guid.h"
-#include "RHICommandList.h"
-#include "RenderCommandFence.h"
 #include "SocketSubsystem.h"
 #include "Sockets.h"
-#include "TextureResource.h"
 #include "UObject/UObjectIterator.h"
 
 namespace
@@ -250,6 +244,10 @@ ASkySimSystem::ASkySimSystem()
 void ASkySimSystem::OnConstruction(const FTransform& Transform)
 {
 	Super::OnConstruction(Transform);
+	if (!bEditorPreviewClockInitialized)
+	{
+		ResetEditorPreviewClock();
+	}
 	RefreshEstimatedCloudSourceCount();
 	UpdateEnvironmentLighting();
 	UpdateVolumeRenderer();
@@ -258,6 +256,10 @@ void ASkySimSystem::OnConstruction(const FTransform& Transform)
 void ASkySimSystem::BeginPlay()
 {
 	Super::BeginPlay();
+	if (!bEditorPreviewClockInitialized)
+	{
+		ResetEditorPreviewClock();
+	}
 
 #if WITH_EDITOR
 	// A Details edit can start the editor-world receiver so the volume preview
@@ -272,6 +274,26 @@ void ASkySimSystem::BeginPlay()
 				EditorSystem->GetWorld()->WorldType == EWorldType::Editor &&
 				EditorSystem->bIsReceiving)
 			{
+				if (EditorSystem->bRuntimeClockHasServerReference)
+				{
+					const double HandoffPlatformSeconds = FPlatformTime::Seconds();
+					const bool bEditorHasFreshSkyState = EditorSystem->bHasSkyState &&
+						EditorSystem->LastSkyStateReceivePlatformSeconds >= 0.0 &&
+						HandoffPlatformSeconds - EditorSystem->LastSkyStateReceivePlatformSeconds <= 2.0;
+					const double HandoffUtcUnixSeconds = EditorSystem->EvaluateRuntimeClockUtc(
+						HandoffPlatformSeconds,
+						EditorSystem->bPreviewInEditor &&
+							(EditorSystem->bAnimateTimeInEditor || bEditorHasFreshSkyState));
+					RebaseRuntimeClockFromServer(
+						HandoffUtcUnixSeconds,
+						EditorSystem->RuntimeClockTimeScale,
+						EditorSystem->RuntimeClockLatitudeDegrees,
+						EditorSystem->RuntimeClockLongitudeDegrees,
+						HandoffPlatformSeconds);
+					// PIE is taking over an already-authoritative editor session. Do not
+					// resend the static authored start time and rewind the server.
+					bAwaitingInitialServerSync = false;
+				}
 				EditorSystem->bEditorReceiverPausedForPIE = true;
 				EditorSystem->StopReceiving();
 				EditorSystem->CloseControlSocket();
@@ -288,7 +310,10 @@ void ASkySimSystem::BeginPlay()
 	}
 	if (bSyncAuthoringSettingsOnConnect)
 	{
-		ScheduleAuthoringSync();
+		if (bAwaitingInitialServerSync)
+		{
+			ScheduleAuthoringSync();
+		}
 	}
 	else if (ControlWeatherPreset == ESkySimWeatherPreset::Natural)
 	{
@@ -338,7 +363,8 @@ void ASkySimSystem::PostEditChangeProperty(FPropertyChangedEvent& PropertyChange
 		PropertyName == GET_MEMBER_NAME_CHECKED(ASkySimSystem, UtcOffsetHours) ||
 		PropertyName == GET_MEMBER_NAME_CHECKED(ASkySimSystem, ControlLatitudeDegrees) ||
 		PropertyName == GET_MEMBER_NAME_CHECKED(ASkySimSystem, ControlLongitudeDegrees) ||
-		PropertyName == GET_MEMBER_NAME_CHECKED(ASkySimSystem, ControlElevationMeters) ||
+		PropertyName == GET_MEMBER_NAME_CHECKED(ASkySimSystem, ControlElevationMeters);
+	const bool bTimeScaleProperty =
 		PropertyName == GET_MEMBER_NAME_CHECKED(ASkySimSystem, ControlTimeScale);
 	const bool bWeatherPresetProperty =
 		PropertyName == GET_MEMBER_NAME_CHECKED(ASkySimSystem, ControlWeatherPreset) ||
@@ -385,6 +411,15 @@ void ASkySimSystem::PostEditChangeProperty(FPropertyChangedEvent& PropertyChange
 			SkyControlsApplyDuePlatformSeconds = FPlatformTime::Seconds() + 0.25;
 		}
 	}
+	if (bTimeScaleProperty)
+	{
+		RebaseRuntimeClockTimeScale(ControlTimeScale);
+		if (bAutoApplySkyControlsInEditor)
+		{
+			bTimeScaleApplyScheduled = true;
+			TimeScaleApplyDuePlatformSeconds = FPlatformTime::Seconds() + 0.25;
+		}
+	}
 	if (bWeatherPresetProperty && bAutoApplySkyControlsInEditor)
 	{
 		bWeatherPresetApplyScheduled = true;
@@ -408,6 +443,7 @@ void ASkySimSystem::PostEditChangeProperty(FPropertyChangedEvent& PropertyChange
 		!bAutoApplySkyControlsInEditor)
 	{
 		bSkyControlsApplyScheduled = false;
+		bTimeScaleApplyScheduled = false;
 		bWeatherPresetApplyScheduled = false;
 		bCustomWeatherApplyScheduled = false;
 	}
@@ -419,9 +455,12 @@ void ASkySimSystem::PostEditChangeProperty(FPropertyChangedEvent& PropertyChange
 	if (PropertyName == GET_MEMBER_NAME_CHECKED(ASkySimSystem, CloudSpreadIterations) ||
 		PropertyName == GET_MEMBER_NAME_CHECKED(ASkySimSystem, CloudSpreadStrength) ||
 		PropertyName == GET_MEMBER_NAME_CHECKED(ASkySimSystem, DensityShapePower) ||
-		PropertyName == GET_MEMBER_NAME_CHECKED(ASkySimSystem, DensityPresentationGain))
+		PropertyName == GET_MEMBER_NAME_CHECKED(ASkySimSystem, DensityPresentationGain) ||
+		PropertyName == GET_MEMBER_NAME_CHECKED(ASkySimSystem, bStabilizeDensityScale) ||
+		PropertyName == GET_MEMBER_NAME_CHECKED(ASkySimSystem, bUsePhysicalDensityScaleForRendering) ||
+		PropertyName == GET_MEMBER_NAME_CHECKED(ASkySimSystem, DensityReferenceScale))
 	{
-		UpdateDensityVolumeTexture();
+		RefreshDensityRendering();
 	}
 	UpdateEnvironmentLighting();
 	UpdateVolumeRenderer();
@@ -471,28 +510,6 @@ void ASkySimSystem::Tick(float DeltaSeconds)
 			StartReceiving();
 		}
 	}
-	if (bEditorWorld && bPreviewInEditor && bAnimateTimeInEditor)
-	{
-		const double Now = FPlatformTime::Seconds();
-		const bool bHasRecentServerState = bHasSkyState && LastSkyStateReceivePlatformSeconds >= 0.0 &&
-			Now - LastSkyStateReceivePlatformSeconds <= 2.0;
-		if (!bHasRecentServerState)
-		{
-			if (!bEditorPreviewClockInitialized)
-			{
-				ResetEditorPreviewClock();
-			}
-			EditorPreviewUtcUnixSeconds = FMath::Clamp(
-				EditorPreviewUtcUnixSeconds + static_cast<double>(DeltaSeconds) * ControlTimeScale,
-				MinimumSkyUtcUnixSeconds,
-				MaximumSkyUtcUnixSeconds);
-			const int64 LocalUnixSeconds = static_cast<int64>(FMath::FloorToDouble(
-				EditorPreviewUtcUnixSeconds + static_cast<double>(UtcOffsetHours) * 3600.0));
-			EditorPreviewLocalDateTime = FDateTime::FromUnixTimestamp(LocalUnixSeconds);
-			UpdateWeatherFog(CustomVisibilityMeters, CustomRelativeHumidity);
-			UpdatePreviewLightingAtUtc(EditorPreviewUtcUnixSeconds);
-		}
-	}
 #endif
 
 	// SKC1 acknowledgement tracking intentionally has one in-flight packet.
@@ -504,7 +521,58 @@ void ASkySimSystem::Tick(float DeltaSeconds)
 		if (bSkyControlsApplyScheduled && Now >= SkyControlsApplyDuePlatformSeconds)
 		{
 			bSkyControlsApplyScheduled = false;
-			ApplyDateTimeAndLocation();
+			const bool bQueuedTimeScaleApply = bTimeScaleApplyScheduled;
+			bTimeScaleApplyScheduled = false;
+			const bool bUsePreservedRuntimeUtc = bUseRuntimeUtcForScheduledSkyControls;
+			const double PreservedRuntimeUtc = EvaluateRuntimeClockUtc(Now, true);
+			const float PreservedRuntimeTimeScale = RuntimeClockTimeScale;
+			bUseRuntimeUtcForScheduledSkyControls = false;
+			if (bUsePreservedRuntimeUtc)
+			{
+				RebaseRuntimeClockFromServer(
+					PreservedRuntimeUtc,
+					PreservedRuntimeTimeScale,
+					ControlLatitudeDegrees,
+					ControlLongitudeDegrees,
+					Now);
+				SendSkyControlCommand(
+					1,
+					3,
+					0,
+					SkyPresetCustom,
+					SkyApplyUtc | SkyApplyLocation | SkyApplyTimeScale,
+					0,
+					static_cast<uint32>(FMath::Max(1, WeatherSeed)),
+					PreservedRuntimeUtc,
+					ControlLatitudeDegrees,
+					ControlLongitudeDegrees,
+					ControlElevationMeters,
+					PreservedRuntimeTimeScale,
+					TEXT("Restoring continuous runtime date, location, and time scale"));
+				if (!PendingControlPacket.IsEmpty())
+				{
+					RuntimeClockResyncControlSequence = PendingControlSequence;
+					if (bQueuedTimeScaleApply)
+					{
+						bTimeScaleOverridePending = true;
+						TimeScaleControlSequence = PendingControlSequence;
+					}
+				}
+				else
+				{
+					bRuntimeClockResyncPending = false;
+					RuntimeClockResyncControlSequence = 0;
+				}
+			}
+			else
+			{
+				ApplyDateTimeAndLocation();
+			}
+		}
+		else if (bTimeScaleApplyScheduled && Now >= TimeScaleApplyDuePlatformSeconds)
+		{
+			bTimeScaleApplyScheduled = false;
+			ApplyTimeScale();
 		}
 		else if (bWeatherPresetApplyScheduled && Now >= WeatherPresetApplyDuePlatformSeconds)
 		{
@@ -522,14 +590,14 @@ void ASkySimSystem::Tick(float DeltaSeconds)
 		}
 	}
 	PumpControlRetry();
-	if (!bIsReceiving)
+	if (bIsReceiving)
 	{
-		return;
+		DrainSocket(SkyStateSocket, true);
+		DrainSocket(VolumeSocket, false);
+		VolumeReceiver.Prune(FPlatformTime::Seconds());
 	}
-
-	DrainSocket(SkyStateSocket, true);
-	DrainSocket(VolumeSocket, false);
-	PruneStaleVolumeFrames();
+	RefreshDensityRendering();
+	UpdateRuntimeClockAndLighting();
 
 	if (bShowDebugOverlay && GEngine != nullptr)
 	{
@@ -542,6 +610,13 @@ void ASkySimSystem::Tick(float DeltaSeconds)
 			CompleteVolumeFrames,
 			LatestVolumeFrameId);
 		GEngine->AddOnScreenDebugMessage(reinterpret_cast<uint64>(this), 0.0f, StatusColor, StatusText);
+		const FString ClockText = FString::Printf(
+			TEXT("SkySim Clock: %s | Local=%s | x%.3f | Sun=%.2f deg"),
+			*RuntimeClockSource,
+			*CurrentLocalDateTime.ToString(TEXT("%Y-%m-%d %H:%M:%S")),
+			CurrentEffectiveTimeScale,
+			CurrentSunElevationDegrees);
+		GEngine->AddOnScreenDebugMessage(reinterpret_cast<uint64>(this) + 1, 0.0f, FColor::Cyan, ClockText);
 	}
 }
 
@@ -569,8 +644,6 @@ bool ASkySimSystem::StartReceiving()
 		StopReceiving();
 		return false;
 	}
-	bAwaitingInitialServerSync = true;
-
 	UE_LOG(LogTemp, Display, TEXT("SkySim: UDP 수신 시작 (CLD2=%d, SKS1=%d)"), VolumePort, SkyStatePort);
 	return true;
 }
@@ -593,8 +666,11 @@ void ASkySimSystem::StopReceiving()
 	bIsReceiving = false;
 	bHasSkyState = false;
 	LastSkyStateReceivePlatformSeconds = -1.0;
-	VolumeFrames.Reset();
-	bAwaitingInitialServerSync = true;
+	VolumeReceiver.Reset();
+	DensityFrames.BreakContinuity();
+	// Keep the displayed pair available for offline presentation edits. The next
+	// published frame starts a new segment through DensityFrames.BreakContinuity.
+	FrozenCloudPlaybackSeconds = FPlatformTime::Seconds();
 }
 
 bool ASkySimSystem::EnsureControlSocket()
@@ -641,6 +717,10 @@ void ASkySimSystem::CloseControlSocket()
 	PendingControlSendAttempts = 0;
 	ControlSessionId = 0;
 	NextControlSequence = 0;
+	bRuntimeClockResyncPending = false;
+	RuntimeClockResyncControlSequence = 0;
+	bTimeScaleOverridePending = false;
+	TimeScaleControlSequence = 0;
 }
 
 bool ASkySimSystem::SendSkyControlCommand(
@@ -804,6 +884,16 @@ void ASkySimSystem::PumpControlRetry()
 			TEXT("No SKS1 acknowledgement for sequence %u"), PendingControlSequence);
 		UE_LOG(LogTemp, Warning, TEXT("SkySim: SKC1 acknowledgement timed out for sequence %u"), PendingControlSequence);
 		PendingControlPacket.Reset();
+		if (PendingControlSequence == RuntimeClockResyncControlSequence)
+		{
+			bRuntimeClockResyncPending = false;
+			RuntimeClockResyncControlSequence = 0;
+		}
+		if (PendingControlSequence == TimeScaleControlSequence)
+		{
+			bTimeScaleOverridePending = false;
+			TimeScaleControlSequence = 0;
+		}
 		PendingControlSequence = 0;
 		PendingControlSendAttempts = 0;
 		return;
@@ -837,6 +927,16 @@ void ASkySimSystem::HandleControlAcknowledgement(uint32 Session, uint32 Sequence
 	{
 		return;
 	}
+	if (Sequence == RuntimeClockResyncControlSequence)
+	{
+		bRuntimeClockResyncPending = false;
+		RuntimeClockResyncControlSequence = 0;
+	}
+	if (Sequence == TimeScaleControlSequence)
+	{
+		bTimeScaleOverridePending = false;
+		TimeScaleControlSequence = 0;
+	}
 
 	PendingControlPacket.Reset();
 	PendingControlSequence = 0;
@@ -846,6 +946,17 @@ void ASkySimSystem::HandleControlAcknowledgement(uint32 Session, uint32 Sequence
 void ASkySimSystem::ApplyDateTimeAndLocation()
 {
 	bSkyControlsApplyScheduled = false;
+	bUseRuntimeUtcForScheduledSkyControls = false;
+	const bool bRuntimeResyncIsInFlight = bRuntimeClockResyncPending &&
+		!PendingControlPacket.IsEmpty() &&
+		PendingControlSequence == RuntimeClockResyncControlSequence;
+	if (!bRuntimeResyncIsInFlight)
+	{
+		bRuntimeClockResyncPending = false;
+		RuntimeClockResyncControlSequence = 0;
+	}
+	bTimeScaleApplyScheduled = false;
+	NextRuntimeClockDiagnosticPlatformSeconds = FPlatformTime::Seconds() + 2.0;
 	if (!FMath::IsFinite(UtcOffsetHours) || UtcOffsetHours < -14.0f || UtcOffsetHours > 14.0f ||
 		ControlLocalDateTime.GetYear() < 1900 || ControlLocalDateTime.GetYear() > 2100)
 	{
@@ -855,7 +966,16 @@ void ASkySimSystem::ApplyDateTimeAndLocation()
 	}
 	const FDateTime UtcDateTime = ControlLocalDateTime - FTimespan::FromHours(UtcOffsetHours);
 	const double ControlUtcUnix = static_cast<double>(UtcDateTime.ToUnixTimestamp());
+	ResetEditorPreviewClock();
 	UpdatePreviewLightingFromControls();
+	if (!PendingControlPacket.IsEmpty())
+	{
+		bSkyControlsApplyScheduled = true;
+		SkyControlsApplyDuePlatformSeconds = FPlatformTime::Seconds();
+		ControlStatus = ESkySimControlStatus::Pending;
+		ControlStatusMessage = TEXT("Date, location, and time scale queued behind the current sky command");
+		return;
+	}
 	SendSkyControlCommand(
 		1,
 		3,
@@ -870,6 +990,11 @@ void ASkySimSystem::ApplyDateTimeAndLocation()
 		ControlElevationMeters,
 		ControlTimeScale,
 		TEXT("Applying date, location, and time scale"));
+	if (!PendingControlPacket.IsEmpty())
+	{
+		bTimeScaleOverridePending = true;
+		TimeScaleControlSequence = PendingControlSequence;
+	}
 }
 
 void ASkySimSystem::ApplyTimeScale()
@@ -878,6 +1003,22 @@ void ASkySimSystem::ApplyTimeScale()
 	{
 		LastNonZeroTimeScale = ControlTimeScale;
 	}
+	if (FMath::IsFinite(ControlTimeScale) && ControlTimeScale >= -86400.0f && ControlTimeScale <= 86400.0f)
+	{
+		RebaseRuntimeClockTimeScale(ControlTimeScale);
+	}
+	if (!PendingControlPacket.IsEmpty())
+	{
+		// The control channel is intentionally single-flight. Preserve the
+		// newest requested scale and send it immediately after the current ACK.
+		bTimeScaleApplyScheduled = true;
+		TimeScaleApplyDuePlatformSeconds = FPlatformTime::Seconds();
+		ControlStatus = ESkySimControlStatus::Pending;
+		ControlStatusMessage = TEXT("Time-scale change queued behind the current sky command");
+		return;
+	}
+
+	bTimeScaleApplyScheduled = false;
 	SendSkyControlCommand(
 		1,
 		3,
@@ -892,6 +1033,11 @@ void ASkySimSystem::ApplyTimeScale()
 		0.0f,
 		ControlTimeScale,
 		TEXT("Applying sky time scale"));
+	if (!PendingControlPacket.IsEmpty())
+	{
+		bTimeScaleOverridePending = true;
+		TimeScaleControlSequence = PendingControlSequence;
+	}
 }
 
 void ASkySimSystem::PauseSkyTime()
@@ -1069,12 +1215,24 @@ void ASkySimSystem::RefreshEstimatedCloudSourceCount()
 	EstimatedCloudSourceCount = FMath::Clamp(FMath::CeilToInt(Coverage * 20.0f), 4, 20);
 }
 
-void ASkySimSystem::ScheduleAuthoringSync()
+void ASkySimSystem::ScheduleAuthoringSync(bool bPreserveRuntimeUtc, double PreservedUtcUnixSeconds)
 {
 	const double DueTime = FPlatformTime::Seconds() + 0.05;
 	bAwaitingInitialServerSync = false;
 	bSkyControlsApplyScheduled = true;
 	SkyControlsApplyDuePlatformSeconds = DueTime;
+	bUseRuntimeUtcForScheduledSkyControls = bPreserveRuntimeUtc &&
+		FMath::IsFinite(PreservedUtcUnixSeconds) &&
+		PreservedUtcUnixSeconds >= MinimumSkyUtcUnixSeconds &&
+		PreservedUtcUnixSeconds <= MaximumSkyUtcUnixSeconds;
+	bRuntimeClockResyncPending = bUseRuntimeUtcForScheduledSkyControls;
+	RuntimeClockResyncControlSequence = 0;
+	// Do not compare the pre-authoring server epoch with the deliberately
+	// authored epoch in progression diagnostics.
+	NextRuntimeClockDiagnosticPlatformSeconds = FMath::Max(
+		NextRuntimeClockDiagnosticPlatformSeconds,
+		DueTime + 2.0);
+	bTimeScaleApplyScheduled = false;
 	bWeatherPresetApplyScheduled = true;
 	WeatherPresetApplyDuePlatformSeconds = DueTime;
 	bCustomWeatherApplyScheduled = bApplyAdvancedWeatherOnConnect;
@@ -1340,19 +1498,14 @@ bool ASkySimSystem::ParseSkyState(const uint8* Data, int32 NumBytes)
 	const float NewMoonIlluminatedFraction = ReadF32(Data, 392);
 	const float NewMoonIlluminanceLux = ReadF32(Data, 396);
 	const double ReceivePlatformSeconds = FPlatformTime::Seconds();
-	const uint32 PreviousSkyStateSequence = static_cast<uint32>(FMath::Max(0, SkyStateSequence));
-	const bool bSequenceMovedFarBackward = bHasSkyState && NewSkyStateSequence < PreviousSkyStateSequence &&
-		PreviousSkyStateSequence - NewSkyStateSequence > 32U;
-	const bool bRestartedAfterReceiveGap = bHasSkyState && LastSkyStateReceivePlatformSeconds >= 0.0 &&
-		ReceivePlatformSeconds - LastSkyStateReceivePlatformSeconds > 5.0 &&
-		NewSkyStateSequence < PreviousSkyStateSequence;
-	// A slow editor frame or shader compile can delay packets for several
-	// seconds without restarting the server. Reapplying the authored clock on
-	// every such gap repeatedly rewinds the sun and Natural weather. Only a
-	// genuine sequence reset is treated as a server reconnect.
-	const bool bServerSequenceRestarted = bSequenceMovedFarBackward || bRestartedAfterReceiveGap;
-	const bool bShouldSynchronizeAuthoring = bSyncAuthoringSettingsOnConnect &&
-		(bAwaitingInitialServerSync || bServerSequenceRestarted);
+	const bool bCanPreserveRuntimeUtc = bEditorPreviewClockInitialized && bRuntimeClockHasServerReference;
+	const double RuntimeUtcBeforePacket = bCanPreserveRuntimeUtc
+		? EvaluateRuntimeClockUtc(ReceivePlatformSeconds, true)
+		: NewUtcUnixSeconds;
+	const float RuntimeTimeScaleBeforePacket = RuntimeClockTimeScale;
+	const double RuntimeLatitudeBeforePacket = RuntimeClockLatitudeDegrees;
+	const double RuntimeLongitudeBeforePacket = RuntimeClockLongitudeDegrees;
+	const uint32 PreviousSkyStateSequence = LastAcceptedSkyStateSequence;
 	const bool bSunFinite = FMath::IsFinite(NewSun.X) && FMath::IsFinite(NewSun.Y) && FMath::IsFinite(NewSun.Z);
 	const bool bMoonFinite = FMath::IsFinite(NewMoon.X) && FMath::IsFinite(NewMoon.Y) && FMath::IsFinite(NewMoon.Z);
 	const bool bEnvironmentFinite = FMath::IsFinite(NewUtcUnixSeconds) && FMath::IsFinite(NewLatitudeDegrees) &&
@@ -1376,31 +1529,143 @@ bool ASkySimSystem::ParseSkyState(const uint8* Data, int32 NumBytes)
 		return false;
 	}
 
+	bool bServerSequenceRestarted = false;
+	if (bHasSkyState)
+	{
+		const int32 SignedSequenceDelta = static_cast<int32>(NewSkyStateSequence - PreviousSkyStateSequence);
+		if (SignedSequenceDelta <= 0)
+		{
+			const bool bSequenceMovedFarBackward = NewSkyStateSequence < PreviousSkyStateSequence &&
+				PreviousSkyStateSequence - NewSkyStateSequence > 32U;
+			const bool bRestartedAfterReceiveGap = LastSkyStateReceivePlatformSeconds >= 0.0 &&
+				ReceivePlatformSeconds - LastSkyStateReceivePlatformSeconds > 5.0 &&
+				NewSkyStateSequence < PreviousSkyStateSequence;
+			if (bSequenceMovedFarBackward || bRestartedAfterReceiveGap)
+			{
+				bServerSequenceRestarted = true;
+				ConsecutiveBackwardSkyPackets = 0;
+			}
+			else if (NewSkyStateSequence < PreviousSkyStateSequence)
+			{
+				// One reordered UDP datagram must never rewind a high-speed clock.
+				// Three consecutive backward packets instead indicate a fast server
+				// restart whose old sequence had not yet advanced past 32.
+				++ConsecutiveBackwardSkyPackets;
+				if (ConsecutiveBackwardSkyPackets < 3)
+				{
+					return false;
+				}
+				bServerSequenceRestarted = true;
+				ConsecutiveBackwardSkyPackets = 0;
+			}
+			else
+			{
+				// A duplicate after backward packets can be the third packet of a
+				// fast restart (for example previous 2 -> new 0, 1, 2). A lone
+				// duplicate is ordinary UDP duplication and remains ignored.
+				if (ConsecutiveBackwardSkyPackets == 0)
+				{
+					return false;
+				}
+				++ConsecutiveBackwardSkyPackets;
+				if (ConsecutiveBackwardSkyPackets < 3)
+				{
+					return false;
+				}
+				bServerSequenceRestarted = true;
+				ConsecutiveBackwardSkyPackets = 0;
+			}
+		}
+		else
+		{
+			ConsecutiveBackwardSkyPackets = 0;
+		}
+	}
+	else if (bCanPreserveRuntimeUtc && !bAwaitingInitialServerSync)
+	{
+		const double AllowedReconnectClockErrorSeconds = FMath::Max(
+			5.0,
+			FMath::Abs(static_cast<double>(RuntimeTimeScaleBeforePacket)) * 0.5);
+		bServerSequenceRestarted = FMath::Abs(NewUtcUnixSeconds - RuntimeUtcBeforePacket) >
+			AllowedReconnectClockErrorSeconds;
+	}
+
+	if (bServerSequenceRestarted)
+	{
+		// A new solver epoch may restart CLD2 IDs and timestamps at zero. Drop
+		// incomplete packets and interpolation history, but retain the wind phase.
+		VolumeReceiver.Reset();
+		DensityFrames.BreakContinuity();
+		CloudMotion.BreakContinuity();
+	}
+	const bool bShouldSynchronizeAuthoring = bSyncAuthoringSettingsOnConnect &&
+		(bAwaitingInitialServerSync || bServerSequenceRestarted);
+	const bool bPreserveContinuityForRestart = bShouldSynchronizeAuthoring &&
+		bServerSequenceRestarted && bCanPreserveRuntimeUtc;
+	const bool bRuntimeResyncAcknowledged = bRuntimeClockResyncPending &&
+		RuntimeClockResyncControlSequence != 0 &&
+		NewControlSession == ControlSessionId &&
+		NewControlSequence == RuntimeClockResyncControlSequence &&
+		(NewControlResult == 1 || NewControlResult == 2);
+	const bool bTimeScaleControlAcknowledged = bTimeScaleOverridePending &&
+		TimeScaleControlSequence != 0 &&
+		NewControlSession == ControlSessionId &&
+		NewControlSequence == TimeScaleControlSequence &&
+		(NewControlResult == 1 || NewControlResult == 2);
+	const bool bUseLocalTimeScaleOverride =
+		(bTimeScaleApplyScheduled || bTimeScaleOverridePending) && !bTimeScaleControlAcknowledged;
+	const bool bHoldRuntimeEnvironment = bPreserveContinuityForRestart ||
+		(bRuntimeClockResyncPending && !bRuntimeResyncAcknowledged);
+
 	SkyStateSequence = static_cast<int32>(NewSkyStateSequence);
+	LastAcceptedSkyStateSequence = NewSkyStateSequence;
 	LatestVolumeFrameId = static_cast<int32>(ReadU32(Data, 20));
-	UtcUnixSeconds = NewUtcUnixSeconds;
 	ServerUtcDateTime = FDateTime::FromUnixTimestamp(static_cast<int64>(FMath::FloorToDouble(NewUtcUnixSeconds)));
 	ServerLocalDateTime = ServerUtcDateTime + FTimespan::FromHours(UtcOffsetHours);
 	ServerLatitudeDegrees = NewLatitudeDegrees;
 	ServerLongitudeDegrees = NewLongitudeDegrees;
 	ServerElevationMeters = NewElevationMeters;
 	ServerTimeScale = NewTimeScale;
+	if (bPreserveContinuityForRestart)
+	{
+		RebaseRuntimeClockFromServer(
+			RuntimeUtcBeforePacket,
+			RuntimeTimeScaleBeforePacket,
+			RuntimeLatitudeBeforePacket,
+			RuntimeLongitudeBeforePacket,
+			ReceivePlatformSeconds);
+	}
+	else if (!bRuntimeClockResyncPending || bRuntimeResyncAcknowledged)
+	{
+		RebaseRuntimeClockFromServer(
+			NewUtcUnixSeconds,
+			bUseLocalTimeScaleOverride ? ControlTimeScale : NewTimeScale,
+			NewLatitudeDegrees,
+			NewLongitudeDegrees,
+			ReceivePlatformSeconds);
+	}
 	ServerDomainExtentMeters = NewDomainExtentMeters;
 	ServerCloudLayerCount = NewCloudLayerCount;
-	RelativeHumidity = NewRelativeHumidity;
-	VisibilityMeters = NewVisibilityMeters;
-	MeanWindEnuMetersPerSecond = NewMeanWind;
-	SunDirectionEnu = NewSun;
-	SunIlluminanceLux = NewSunIlluminanceLux;
-	MoonDirectionEnu = NewMoon;
-	MoonIlluminatedFraction = NewMoonIlluminatedFraction;
-	MoonIlluminanceLux = NewMoonIlluminanceLux;
+	if (!bHoldRuntimeEnvironment)
+	{
+		UtcUnixSeconds = NewUtcUnixSeconds;
+		RelativeHumidity = NewRelativeHumidity;
+		VisibilityMeters = NewVisibilityMeters;
+		MeanWindEnuMetersPerSecond = NewMeanWind;
+		SunDirectionEnu = NewSun;
+		SunIlluminanceLux = NewSunIlluminanceLux;
+		MoonDirectionEnu = NewMoon;
+		MoonIlluminatedFraction = NewMoonIlluminatedFraction;
+		MoonIlluminanceLux = NewMoonIlluminanceLux;
+	}
 	bHasSkyState = true;
 	LastSkyStateReceivePlatformSeconds = ReceivePlatformSeconds;
 	HandleControlAcknowledgement(NewControlSession, NewControlSequence, NewControlResult);
 	if (bShouldSynchronizeAuthoring)
 	{
-		ScheduleAuthoringSync();
+		ScheduleAuthoringSync(
+			bPreserveContinuityForRestart,
+			RuntimeUtcBeforePacket);
 	}
 	UpdateEnvironmentLighting();
 	if (bUseServerDomainSize)
@@ -1413,291 +1678,51 @@ bool ASkySimSystem::ParseSkyState(const uint8* Data, int32 NumBytes)
 
 bool ASkySimSystem::ParseVolumePacket(const uint8* Data, int32 NumBytes)
 {
-	if (NumBytes < 64 || !HasMagic(Data, "CLD2") || ReadU16(Data, 4) != 2 || ReadU16(Data, 6) != 64)
+	FSkySimDensityFrame CompletedFrame;
+	const FSkySimVolumeReceiver::EPacketResult Result = VolumeReceiver.Consume(
+		Data, NumBytes, FPlatformTime::Seconds(), CompletedFrame);
+	if (Result == FSkySimVolumeReceiver::EPacketResult::Rejected)
 	{
 		++RejectedVolumePackets;
 		return false;
 	}
-
-	const uint32 FrameId = ReadU32(Data, 8);
-	const uint32 FieldCrc32 = ReadU32(Data, 12);
-	const double SimulationTime = ReadF64(Data, 16);
-	const uint16 GridX = ReadU16(Data, 24);
-	const uint16 GridY = ReadU16(Data, 26);
-	const uint16 GridZ = ReadU16(Data, 28);
-	const uint8 VoxelFormat = Data[30];
-	const uint8 FieldId = Data[31];
-	const uint8 ChannelCount = Data[32];
-	const uint8 Compression = Data[33];
-	const uint16 PayloadBytes = ReadU16(Data, 38);
-	const uint16 ChunkIndex = ReadU16(Data, 34);
-	const uint16 ChunkCount = ReadU16(Data, 36);
-	const uint16 FieldMask = ReadU16(Data, 40);
-	const uint16 Flags = ReadU16(Data, 42);
-	const uint32 PayloadOffset = ReadU32(Data, 44);
-	const uint32 EncodedBytes = ReadU32(Data, 48);
-	const uint32 DecodedBytes = ReadU32(Data, 52);
-	const float ValueScale = ReadF32(Data, 56);
-	const float ValueBias = ReadF32(Data, 60);
-
-	static constexpr uint32 MaxPayloadBytes = 1200;
-	static constexpr uint32 MaxFieldBytes = 64 * 1024 * 1024;
-	static constexpr uint16 SupportedFieldMask = 0x001f;
-	static constexpr uint16 MacroFieldMask = 0x000f;
-	const uint16 FieldBit = FieldId >= 1 && FieldId <= 5 ? static_cast<uint16>(1u << (FieldId - 1u)) : 0;
-	const uint32 BytesPerChannel = (VoxelFormat == 1 || VoxelFormat == 3) ? 1u :
-		(VoxelFormat == 2 || VoxelFormat == 4) ? 2u : 0u;
-	const uint8 ExpectedFormat[5] = {2, 4, 1, 1, 1};
-	const uint8 ExpectedChannels[5] = {1, 3, 1, 1, 1};
-	const uint64 ExpectedDecodedBytes = static_cast<uint64>(GridX) * GridY * GridZ * ChannelCount * BytesPerChannel;
-	const uint32 ExpectedChunkCount = EncodedBytes == 0 ? 0 : (EncodedBytes + MaxPayloadBytes - 1u) / MaxPayloadBytes;
-	const uint32 ExpectedPayloadBytes = PayloadOffset < EncodedBytes ? FMath::Min(MaxPayloadBytes, EncodedBytes - PayloadOffset) : 0;
-	const uint8 OccupancyBrick = static_cast<uint8>(Flags >> 8);
-	const bool bFlagsValid = (Flags & 0x00feu) == 0u &&
-		((FieldId == 5 && (OccupancyBrick == 2 || OccupancyBrick == 4 || OccupancyBrick == 8)) ||
-		 (FieldId != 5 && OccupancyBrick == 0));
-
-	if (FieldBit == 0 || VoxelFormat != ExpectedFormat[FieldId - 1] || ChannelCount != ExpectedChannels[FieldId - 1] ||
-		Compression > 1 || !FMath::IsFinite(SimulationTime) || !FMath::IsFinite(ValueScale) || !FMath::IsFinite(ValueBias) ||
-		GridX == 0 || GridY == 0 || GridZ == 0 || BytesPerChannel == 0 || ExpectedDecodedBytes != DecodedBytes ||
-		EncodedBytes == 0 || EncodedBytes > MaxFieldBytes || DecodedBytes > MaxFieldBytes ||
-		FieldMask == 0 || (FieldMask & ~SupportedFieldMask) != 0 || (FieldMask & FieldBit) == 0 ||
-		(FieldId == 5 && (FieldMask & MacroFieldMask) == 0) || !bFlagsValid ||
-		PayloadBytes > MaxPayloadBytes || NumBytes != 64 + PayloadBytes || ChunkCount != ExpectedChunkCount ||
-		ChunkIndex >= ChunkCount || PayloadOffset != static_cast<uint32>(ChunkIndex) * MaxPayloadBytes ||
-		PayloadBytes != ExpectedPayloadBytes || PayloadOffset + PayloadBytes > EncodedBytes)
-	{
-		++RejectedVolumePackets;
-		return false;
-	}
-
-	FVolumeFrameAssembly* Frame = VolumeFrames.Find(FrameId);
-	if (Frame == nullptr)
-	{
-		if (VolumeFrames.Num() >= 8)
-		{
-			PruneStaleVolumeFrames();
-			if (VolumeFrames.Num() >= 8)
-			{
-				double OldestTime = TNumericLimits<double>::Max();
-				uint32 OldestId = 0;
-				for (const TPair<uint32, FVolumeFrameAssembly>& Pair : VolumeFrames)
-				{
-					if (Pair.Value.LastReceivedPlatformSeconds < OldestTime)
-					{
-						OldestTime = Pair.Value.LastReceivedPlatformSeconds;
-						OldestId = Pair.Key;
-					}
-				}
-				VolumeFrames.Remove(OldestId);
-			}
-		}
-
-		FVolumeFrameAssembly NewFrame;
-		NewFrame.FrameId = FrameId;
-		NewFrame.SimulationTime = SimulationTime;
-		NewFrame.FieldMask = FieldMask;
-		NewFrame.LastReceivedPlatformSeconds = FPlatformTime::Seconds();
-		Frame = &VolumeFrames.Add(FrameId, MoveTemp(NewFrame));
-	}
-	else if (Frame->FieldMask != FieldMask || Frame->SimulationTime != SimulationTime)
-	{
-		VolumeFrames.Remove(FrameId);
-		++RejectedVolumePackets;
-		return false;
-	}
-
-	for (const TPair<uint8, FVolumeFieldAssembly>& Pair : Frame->Fields)
-	{
-		const FVolumeFieldAssembly& Other = Pair.Value;
-		if (FieldId <= 4 && Pair.Key <= 4 && Other.GridSize != FIntVector(GridX, GridY, GridZ))
-		{
-			VolumeFrames.Remove(FrameId);
-			++RejectedVolumePackets;
-			return false;
-		}
-		if (FieldId == 5 && Pair.Key <= 4)
-		{
-			const FIntVector ExpectedSize(
-				(Other.GridSize.X + OccupancyBrick - 1) / OccupancyBrick,
-				(Other.GridSize.Y + OccupancyBrick - 1) / OccupancyBrick,
-				(Other.GridSize.Z + OccupancyBrick - 1) / OccupancyBrick);
-			if (ExpectedSize != FIntVector(GridX, GridY, GridZ))
-			{
-				VolumeFrames.Remove(FrameId);
-				++RejectedVolumePackets;
-				return false;
-			}
-		}
-		if (FieldId <= 4 && Pair.Key == 5)
-		{
-			const uint8 OtherBrick = static_cast<uint8>(Other.Flags >> 8);
-			const FIntVector ExpectedSize(
-				(GridX + OtherBrick - 1) / OtherBrick,
-				(GridY + OtherBrick - 1) / OtherBrick,
-				(GridZ + OtherBrick - 1) / OtherBrick);
-			if (ExpectedSize != Other.GridSize)
-			{
-				VolumeFrames.Remove(FrameId);
-				++RejectedVolumePackets;
-				return false;
-			}
-		}
-	}
-
-	FVolumeFieldAssembly* Field = Frame->Fields.Find(FieldId);
-	if (Field == nullptr)
-	{
-		FVolumeFieldAssembly NewField;
-		NewField.GridSize = FIntVector(GridX, GridY, GridZ);
-		NewField.FieldCrc32 = FieldCrc32;
-		NewField.VoxelFormat = VoxelFormat;
-		NewField.FieldId = FieldId;
-		NewField.ChannelCount = ChannelCount;
-		NewField.Compression = Compression;
-		NewField.ChunkCount = ChunkCount;
-		NewField.Flags = Flags;
-		NewField.EncodedBytes = EncodedBytes;
-		NewField.DecodedBytes = DecodedBytes;
-		NewField.ValueScale = ValueScale;
-		NewField.ValueBias = ValueBias;
-		NewField.Encoded.SetNumZeroed(static_cast<int32>(EncodedBytes));
-		NewField.ReceivedChunks.Init(false, ChunkCount);
-		Field = &Frame->Fields.Add(FieldId, MoveTemp(NewField));
-	}
-	else if (Field->GridSize != FIntVector(GridX, GridY, GridZ) || Field->FieldCrc32 != FieldCrc32 ||
-		Field->VoxelFormat != VoxelFormat || Field->ChannelCount != ChannelCount || Field->Compression != Compression ||
-		Field->ChunkCount != ChunkCount || Field->Flags != Flags || Field->EncodedBytes != EncodedBytes ||
-		Field->DecodedBytes != DecodedBytes || Field->ValueScale != ValueScale || Field->ValueBias != ValueBias)
-	{
-		VolumeFrames.Remove(FrameId);
-		++RejectedVolumePackets;
-		return false;
-	}
-
-	const uint8* Payload = Data + 64;
-	if (Field->ReceivedChunks[ChunkIndex])
-	{
-		if (FMemory::Memcmp(Field->Encoded.GetData() + PayloadOffset, Payload, PayloadBytes) != 0)
-		{
-			VolumeFrames.Remove(FrameId);
-			++RejectedVolumePackets;
-			return false;
-		}
-	}
-	else
-	{
-		FMemory::Memcpy(Field->Encoded.GetData() + PayloadOffset, Payload, PayloadBytes);
-		Field->ReceivedChunks[ChunkIndex] = true;
-		++Field->ReceivedChunkCount;
-	}
-
-	if (Field->ReceivedChunkCount == Field->ChunkCount && !Field->IsComplete() && !DecodeCompletedField(*Field))
-	{
-		VolumeFrames.Remove(FrameId);
-		++RejectedVolumePackets;
-		return false;
-	}
-
-	Frame->LastReceivedPlatformSeconds = FPlatformTime::Seconds();
 	++ValidVolumePackets;
-	uint16 CompleteMask = 0;
-	for (const TPair<uint8, FVolumeFieldAssembly>& Pair : Frame->Fields)
+	if (Result == FSkySimVolumeReceiver::EPacketResult::FrameComplete)
 	{
-		if (Pair.Value.IsComplete())
-		{
-			CompleteMask |= static_cast<uint16>(1u << (Pair.Key - 1u));
-		}
-	}
-	if (CompleteMask == Frame->FieldMask)
-	{
-		PublishCompletedFrame(FrameId);
+		PublishCompletedFrame(MoveTemp(CompletedFrame));
 	}
 	return true;
 }
 
-bool ASkySimSystem::DecodeCompletedField(FVolumeFieldAssembly& Field) const
+void ASkySimSystem::PublishCompletedFrame(FSkySimDensityFrame&& CompletedFrame)
 {
-	if (Field.Compression == 0)
+	const FSkySimDensityFrame& LastFrame = DensityFrames.GetCurrent();
+	if (LastFrame.IsValid() && CompletedFrame.ReceivePlatformSeconds - LastFrame.ReceivePlatformSeconds > 2.0)
 	{
-		if (Field.EncodedBytes != Field.DecodedBytes)
-		{
-			return false;
-		}
-		Field.Decoded = MoveTemp(Field.Encoded);
+		// Density-only senders have no SKS1 restart signal. A prolonged gap starts
+		// a new interpolation segment rather than blending across an outage.
+		DensityFrames.BreakContinuity();
 	}
-	else
-	{
-		Field.Decoded.Reset(static_cast<int32>(Field.DecodedBytes));
-		int32 InputPosition = 0;
-		while (InputPosition < Field.Encoded.Num())
-		{
-			const uint8 Control = Field.Encoded[InputPosition++];
-			if ((Control & 0x80u) != 0)
-			{
-				if (InputPosition >= Field.Encoded.Num())
-				{
-					return false;
-				}
-				const int32 RunLength = (Control & 0x7fu) + 3;
-				if (Field.Decoded.Num() > static_cast<int32>(Field.DecodedBytes) - RunLength)
-				{
-					return false;
-				}
-				Field.Decoded.AddUninitialized(RunLength);
-				FMemory::Memset(Field.Decoded.GetData() + Field.Decoded.Num() - RunLength, Field.Encoded[InputPosition++], RunLength);
-			}
-			else
-			{
-				const int32 LiteralLength = Control + 1;
-				if (InputPosition > Field.Encoded.Num() - LiteralLength || Field.Decoded.Num() > static_cast<int32>(Field.DecodedBytes) - LiteralLength)
-				{
-					return false;
-				}
-				Field.Decoded.Append(Field.Encoded.GetData() + InputPosition, LiteralLength);
-				InputPosition += LiteralLength;
-			}
-		}
-		if (Field.Decoded.Num() != static_cast<int32>(Field.DecodedBytes))
-		{
-			return false;
-		}
-		Field.Encoded.Reset();
-	}
-
-	Field.ReceivedChunks.Empty();
-	return FCrc::MemCrc32(Field.Decoded.GetData(), Field.Decoded.Num()) == Field.FieldCrc32;
-}
-
-void ASkySimSystem::PublishCompletedFrame(uint32 FrameId)
-{
-	FVolumeFrameAssembly* Frame = VolumeFrames.Find(FrameId);
-	if (Frame == nullptr)
+	if (!DensityFrames.Publish(MoveTemp(CompletedFrame)))
 	{
 		return;
 	}
-	FVolumeFieldAssembly* Density = Frame->Fields.Find(1);
-	if (Density == nullptr || Density->VoxelFormat != 2 || Density->ChannelCount != 1 || !Density->IsComplete())
-	{
-		VolumeFrames.Remove(FrameId);
-		return;
-	}
-
-	DensityGridSize = Density->GridSize;
-	DensityValueScale = Density->ValueScale;
-	DensityValueBias = Density->ValueBias;
-	LatestDensityBytes = MoveTemp(Density->Decoded);
-	LatestVolumeFrameId = static_cast<int32>(FrameId);
+	const FSkySimDensityFrame& Frame = DensityFrames.GetCurrent();
+	CloudMotion.PushFrame(Frame, DensityFrames.GetPrevious().IsValid());
+	DensityGridSize = Frame.GridSize;
+	DensityValueScale = Frame.ValueScale;
+	DensityValueBias = Frame.ValueBias;
+	LatestVolumeFrameId = static_cast<int32>(Frame.FrameId);
 	bHasCompleteVolumeFrame = true;
 	++CompleteVolumeFrames;
 
 	uint16 Minimum = TNumericLimits<uint16>::Max();
 	uint16 Maximum = 0;
 	uint64 Sum = 0;
-	const int32 VoxelCount = LatestDensityBytes.Num() / 2;
+	const int32 VoxelCount = Frame.Bytes.Num() / 2;
 	for (int32 Index = 0; Index < VoxelCount; ++Index)
 	{
-		const uint16 Value = ReadU16(LatestDensityBytes.GetData(), Index * 2);
+		const uint16 Value = ReadU16(Frame.Bytes.GetData(), Index * 2);
 		Minimum = FMath::Min(Minimum, Value);
 		Maximum = FMath::Max(Maximum, Value);
 		Sum += Value;
@@ -1706,14 +1731,13 @@ void ASkySimSystem::PublishCompletedFrame(uint32 FrameId)
 	DensityMinimum = VoxelCount > 0 ? Minimum * Normalizer : 0.0f;
 	DensityMaximum = VoxelCount > 0 ? Maximum * Normalizer : 0.0f;
 	DensityMean = VoxelCount > 0 ? static_cast<float>(static_cast<double>(Sum) / VoxelCount) * Normalizer : 0.0f;
-	UpdateDensityVolumeTexture();
 	if (CompleteVolumeFrames == 1 || CompleteVolumeFrames % 100 == 0)
 	{
 		UE_LOG(
 			LogTemp,
 			Display,
 			TEXT("SkySim: CLD2 완성 frame=%u grid=%dx%dx%d density[max=%.6f, mean=%.6f, scale=%.6f, bias=%.6f]"),
-			FrameId,
+			Frame.FrameId,
 			DensityGridSize.X,
 			DensityGridSize.Y,
 			DensityGridSize.Z,
@@ -1723,340 +1747,6 @@ void ASkySimSystem::PublishCompletedFrame(uint32 FrameId)
 			DensityValueBias);
 	}
 
-	VolumeFrames.Remove(FrameId);
-}
-
-void ASkySimSystem::BuildPresentedDensityBytes()
-{
-	const int32 SizeX = DensityGridSize.X;
-	const int32 SizeY = DensityGridSize.Y;
-	const int32 SizeZ = DensityGridSize.Z;
-	const int32 VoxelCount = SizeX * SizeY * SizeZ;
-	if (SizeX <= 0 || SizeY <= 0 || SizeZ <= 0 || LatestDensityBytes.Num() != VoxelCount * 2)
-	{
-		PresentedDensityBytes.Reset();
-		return;
-	}
-
-	DensityPresentationWorking.SetNumUninitialized(VoxelCount);
-	DensityPresentationScratchA.SetNumUninitialized(VoxelCount);
-	DensityPresentationScratchB.SetNumUninitialized(VoxelCount);
-	PresentedDensityBytes.SetNumUninitialized(VoxelCount * 2);
-
-	constexpr float InverseUInt16Maximum = 1.0f / 65535.0f;
-	for (int32 Index = 0; Index < VoxelCount; ++Index)
-	{
-		DensityPresentationWorking[Index] = ReadU16(LatestDensityBytes.GetData(), Index * 2) * InverseUInt16Maximum;
-	}
-
-	const auto GetIndex = [SizeX, SizeY](int32 X, int32 Y, int32 Z)
-	{
-		return (Z * SizeY + Y) * SizeX + X;
-	};
-	const auto MaxFilterAxis = [SizeX, SizeY, SizeZ, &GetIndex](
-		const TArray<float>& Source, TArray<float>& Destination, int32 Axis)
-	{
-		for (int32 Z = 0; Z < SizeZ; ++Z)
-		{
-			for (int32 Y = 0; Y < SizeY; ++Y)
-			{
-				for (int32 X = 0; X < SizeX; ++X)
-				{
-					float Maximum = Source[GetIndex(X, Y, Z)];
-					if (Axis == 0)
-					{
-						if (X > 0) Maximum = FMath::Max(Maximum, Source[GetIndex(X - 1, Y, Z)]);
-						if (X + 1 < SizeX) Maximum = FMath::Max(Maximum, Source[GetIndex(X + 1, Y, Z)]);
-					}
-					else if (Axis == 1)
-					{
-						if (Y > 0) Maximum = FMath::Max(Maximum, Source[GetIndex(X, Y - 1, Z)]);
-						if (Y + 1 < SizeY) Maximum = FMath::Max(Maximum, Source[GetIndex(X, Y + 1, Z)]);
-					}
-					else
-					{
-						if (Z > 0) Maximum = FMath::Max(Maximum, Source[GetIndex(X, Y, Z - 1)]);
-						if (Z + 1 < SizeZ) Maximum = FMath::Max(Maximum, Source[GetIndex(X, Y, Z + 1)]);
-					}
-					Destination[GetIndex(X, Y, Z)] = Maximum;
-				}
-			}
-		}
-	};
-
-	const int32 SpreadIterations = FMath::Clamp(CloudSpreadIterations, 0, 3);
-	const float SpreadStrength = FMath::Clamp(CloudSpreadStrength, 0.0f, 1.0f);
-	for (int32 Iteration = 0; Iteration < SpreadIterations && SpreadStrength > 0.0f; ++Iteration)
-	{
-		// Three separable max passes yield a rounded 3x3x3 neighborhood without
-		// adding any texture samples to the heterogeneous-volume ray marcher.
-		MaxFilterAxis(DensityPresentationWorking, DensityPresentationScratchA, 0);
-		MaxFilterAxis(DensityPresentationScratchA, DensityPresentationScratchB, 1);
-		MaxFilterAxis(DensityPresentationScratchB, DensityPresentationScratchA, 2);
-		for (int32 Index = 0; Index < VoxelCount; ++Index)
-		{
-			DensityPresentationWorking[Index] = FMath::Max(
-				DensityPresentationWorking[Index], DensityPresentationScratchA[Index] * SpreadStrength);
-		}
-	}
-
-	const float ShapePower = FMath::Clamp(DensityShapePower, 0.1f, 2.0f);
-	const float PresentationGain = FMath::Clamp(DensityPresentationGain, 0.0f, 4.0f);
-	for (int32 Index = 0; Index < VoxelCount; ++Index)
-	{
-		const float ShapedDensity = FMath::Clamp(
-			FMath::Pow(FMath::Max(DensityPresentationWorking[Index], 0.0f), ShapePower) * PresentationGain,
-			0.0f,
-			1.0f);
-		WriteU16(PresentedDensityBytes, Index * 2, static_cast<uint16>(FMath::RoundToInt(ShapedDensity * 65535.0f)));
-	}
-}
-
-void ASkySimSystem::UpdateDensityVolumeTexture()
-{
-	if (DensityGridSize.X <= 0 || DensityGridSize.Y <= 0 || DensityGridSize.Z <= 0 ||
-		LatestDensityBytes.Num() != DensityGridSize.X * DensityGridSize.Y * DensityGridSize.Z * 2)
-	{
-		return;
-	}
-	BuildPresentedDensityBytes();
-	if (PresentedDensityBytes.Num() != LatestDensityBytes.Num())
-	{
-		return;
-	}
-
-	const bool bNeedsNewTexture = DensityVolumeTexture == nullptr ||
-		DensityVolumeTexture->GetSizeX() != DensityGridSize.X ||
-		DensityVolumeTexture->GetSizeY() != DensityGridSize.Y ||
-		DensityVolumeTexture->GetSizeZ() != DensityGridSize.Z ||
-		DensityVolumeTexture->GetPixelFormat() != PF_G16;
-
-	if (bNeedsNewTexture)
-	{
-		DensityVolumeTexture = UVolumeTexture::CreateTransient(
-			DensityGridSize.X,
-			DensityGridSize.Y,
-			DensityGridSize.Z,
-			PF_G16,
-			TEXT("SkySimDensityVolume"));
-		if (DensityVolumeTexture == nullptr || DensityVolumeTexture->GetPlatformData() == nullptr ||
-			DensityVolumeTexture->GetPlatformData()->Mips.IsEmpty())
-		{
-			DensityVolumeTexture = nullptr;
-			return;
-		}
-
-		DensityVolumeTexture->SRGB = false;
-		DensityVolumeTexture->NeverStream = true;
-		DensityVolumeTexture->Filter = TF_Bilinear;
-		// The material samples continuous, warped XY coordinates so Wrap blends the
-		// last and first density texels at every 20 km seam. Its Z coordinate is
-		// clamped to half-texel bounds separately, preventing top-to-ground leakage.
-		DensityVolumeTexture->AddressMode = TA_Wrap;
-		FTexture2DMipMap& Mip = DensityVolumeTexture->GetPlatformData()->Mips[0];
-		void* MipData = Mip.BulkData.Lock(LOCK_READ_WRITE);
-		FMemory::Memcpy(MipData, PresentedDensityBytes.GetData(), PresentedDensityBytes.Num());
-		Mip.BulkData.Unlock();
-		DensityVolumeTexture->UpdateResource();
-		UpdateVolumeRenderer();
-		return;
-	}
-
-	FTextureResource* Resource = DensityVolumeTexture->GetResource();
-	if (Resource == nullptr || !Resource->TextureRHI.IsValid())
-	{
-		return;
-	}
-
-	FTextureRHIRef TextureRHI = Resource->TextureRHI;
-	TArray<uint8> UploadBytes = PresentedDensityBytes;
-	const FIntVector UploadSize = DensityGridSize;
-	ENQUEUE_RENDER_COMMAND(SkySimUpdateDensityVolume)(
-		[TextureRHI, UploadBytes = MoveTemp(UploadBytes), UploadSize](FRHICommandListImmediate& RHICmdList)
-		{
-			const FUpdateTextureRegion3D Region(0, 0, 0, 0, 0, 0, UploadSize.X, UploadSize.Y, UploadSize.Z);
-			RHICmdList.UpdateTexture3D(
-				TextureRHI,
-				0,
-				Region,
-				UploadSize.X * 2,
-				UploadSize.X * UploadSize.Y * 2,
-				UploadBytes.GetData());
-			RHICmdList.Transition(FRHITransitionInfo(TextureRHI, ERHIAccess::Unknown, ERHIAccess::SRVMask));
-		});
-	UpdateVolumeRenderer();
-}
-
-void ASkySimSystem::UpdateVolumeRenderer()
-{
-	if (CloudVolumeComponent == nullptr)
-	{
-		return;
-	}
-
-	CloudVolumeComponent->SetVisibility(bEnableVolumeRendering, true);
-	if (!bEnableVolumeRendering)
-	{
-		return;
-	}
-
-	UMaterialInterface* AssignedVolumeMaterial = CloudVolumeComponent->GetMaterial(0);
-	if (AssignedVolumeMaterial == nullptr)
-	{
-		AssignedVolumeMaterial = LoadObject<UMaterialInterface>(
-			nullptr,
-			TEXT("/Game/SkySim/M_SkySimVolume.M_SkySimVolume"));
-		if (AssignedVolumeMaterial != nullptr)
-		{
-			CloudVolumeComponent->SetMaterial(0, AssignedVolumeMaterial);
-		}
-	}
-
-	// A material serialized on the placed actor can reach BeginPlay before the
-	// component has created its internal MID. Create it deterministically here
-	// so the transient density texture and all scalar parameters are bound on
-	// the very first complete network frame.
-	if (CloudVolumeComponent->MaterialInstanceDynamic == nullptr && AssignedVolumeMaterial != nullptr)
-	{
-		UMaterialInstanceDynamic* VolumeMaterialInstance =
-			UMaterialInstanceDynamic::Create(AssignedVolumeMaterial, this);
-		if (VolumeMaterialInstance != nullptr)
-		{
-			CloudVolumeComponent->SetMaterial(0, VolumeMaterialInstance);
-		}
-	}
-
-	FVector BaseVolumeSizeCm = RenderVolumeSizeCm;
-	if (bUseServerDomainSize && ServerDomainExtentMeters.X > 0.0 &&
-		ServerDomainExtentMeters.Y > 0.0 && ServerDomainExtentMeters.Z > 0.0)
-	{
-		BaseVolumeSizeCm = ServerDomainExtentMeters * FMath::Max(0.001f, UnrealUnitsPerMeter);
-	}
-	int32 HorizontalTileCount = 1;
-	if (bEnableWideCloudWorld)
-	{
-		if (bAutoHorizontalTileCount)
-		{
-			const double RequestedExtentCm =
-				static_cast<double>(FMath::Clamp(CloudWorldHorizontalExtentKm, 20.0f, 500.0f)) * 100000.0;
-			const double BaseHorizontalExtentCm = FMath::Max(1.0, FMath::Min(BaseVolumeSizeCm.X, BaseVolumeSizeCm.Y));
-			HorizontalTileCount = FMath::Clamp(
-				FMath::CeilToInt(RequestedExtentCm / BaseHorizontalExtentCm), 1, 64);
-		}
-		else
-		{
-			HorizontalTileCount = FMath::Clamp(ManualHorizontalTileCount, 1, 64);
-		}
-	}
-	FVector EffectiveVolumeSizeCm = BaseVolumeSizeCm;
-	EffectiveVolumeSizeCm.X *= HorizontalTileCount;
-	EffectiveVolumeSizeCm.Y *= HorizontalTileCount;
-	EffectiveCloudWorldExtentKm = static_cast<float>(
-		FMath::Min(EffectiveVolumeSizeCm.X, EffectiveVolumeSizeCm.Y) / 100000.0);
-	const float SamplingQuality = HorizontalTileCount > 1
-		? FMath::Clamp(WideCloudSamplingQuality, 0.25f, 1.0f)
-		: 1.0f;
-	// The component resolution below already accounts for tile count and quality.
-	// Dividing the ray step by those values again would double-compensate.
-	CloudVolumeComponent->StepFactor = 1.0f;
-	CloudVolumeComponent->ShadowStepFactor = 2.0f;
-	// VolumeResolution controls traversal, occupancy and lighting-cache
-	// discretization. Keeping it at the 64^3 server grid while stretching the
-	// component to 120 km quantizes the whole sky into 1.875 km blocks. Allocate
-	// horizontal render voxels for the visible tile count (scaled by authored
-	// quality) so each repeated 20 km tile retains its source-grid detail.
-	const int32 HorizontalBakeMultiplier = FMath::Clamp(
-		FMath::RoundToInt(HorizontalTileCount * SamplingQuality),
-		1,
-		HorizontalTileCount);
-	FIntVector RenderVolumeResolution = DensityGridSize;
-	RenderVolumeResolution.X = FMath::Clamp(
-		DensityGridSize.X * HorizontalBakeMultiplier, 1, 1024);
-	RenderVolumeResolution.Y = FMath::Clamp(
-		DensityGridSize.Y * HorizontalBakeMultiplier, 1, 1024);
-
-	if (DensityGridSize.X > 0 && DensityGridSize.Y > 0 && DensityGridSize.Z > 0)
-	{
-		CloudVolumeComponent->SetVolumeResolution(RenderVolumeResolution);
-		const FVector GridSize(RenderVolumeResolution);
-		CloudVolumeComponent->SetRelativeScale3D(EffectiveVolumeSizeCm / GridSize);
-		// The simulation origin is the centre of the horizontal domain and its
-		// vertical origin is the ground/domain floor.
-		CloudVolumeComponent->SetRelativeLocation(
-			FVector(-0.5 * EffectiveVolumeSizeCm.X, -0.5 * EffectiveVolumeSizeCm.Y, 0.0));
-	}
-
-	UMaterialInstanceDynamic* MaterialInstance = CloudVolumeComponent->MaterialInstanceDynamic;
-	if (MaterialInstance != nullptr)
-	{
-		if (DensityVolumeTexture != nullptr)
-		{
-			MaterialInstance->SetTextureParameterValue(TEXT("DensityVolume"), DensityVolumeTexture);
-			MaterialInstance->SetTextureParameterValue(TEXT("DensityVolumeSecondary"), DensityVolumeTexture);
-		}
-		if (RenderVolumeResolution.X > 0 && RenderVolumeResolution.Y > 0 && RenderVolumeResolution.Z > 0)
-		{
-			MaterialInstance->SetVectorParameterValue(
-				TEXT("InvVolumeResolution"),
-				FLinearColor(
-					1.0f / RenderVolumeResolution.X,
-					1.0f / RenderVolumeResolution.Y,
-					1.0f / RenderVolumeResolution.Z,
-					0.0f));
-			MaterialInstance->SetVectorParameterValue(
-				TEXT("InvDensityTextureResolution"),
-				FLinearColor(
-					1.0f / DensityGridSize.X,
-					1.0f / DensityGridSize.Y,
-					1.0f / DensityGridSize.Z,
-					0.0f));
-		}
-		MaterialInstance->SetScalarParameterValue(TEXT("ExtinctionScale"), ExtinctionScale);
-		MaterialInstance->SetScalarParameterValue(
-			TEXT("DensityValueScale"),
-			bUsePhysicalDensityScaleForRendering ? DensityValueScale : 1.0f);
-		MaterialInstance->SetScalarParameterValue(
-			TEXT("DensityValueBias"),
-			bUsePhysicalDensityScaleForRendering ? DensityValueBias : 0.0f);
-		MaterialInstance->SetVectorParameterValue(TEXT("CloudAlbedo"), CloudAlbedo);
-		MaterialInstance->SetScalarParameterValue(TEXT("DebugEmissionScale"), DebugEmissionScale);
-		MaterialInstance->SetScalarParameterValue(TEXT("DetailErosionStrength"), DetailErosionStrength);
-		MaterialInstance->SetScalarParameterValue(TEXT("HorizontalTileCount"), static_cast<float>(HorizontalTileCount));
-		MaterialInstance->SetScalarParameterValue(TEXT("MacroVariationStrength"), MacroVariationStrength);
-		MaterialInstance->SetScalarParameterValue(
-			TEXT("DensityCoordinateWarpStrength"), DensityCoordinateWarpStrength);
-		MaterialInstance->SetScalarParameterValue(
-			TEXT("SecondaryPatternBlendStrength"), SecondaryPatternBlendStrength);
-		MaterialInstance->SetVectorParameterValue(
-			TEXT("MacroVariationTiling"),
-			FLinearColor(MacroVariationTiling.X, MacroVariationTiling.Y, MacroVariationTiling.Z, 0.0f));
-		MaterialInstance->SetVectorParameterValue(
-			TEXT("SecondaryPatternScale"),
-			FLinearColor(SecondaryPatternScale.X, SecondaryPatternScale.Y, SecondaryPatternScale.Z, 0.0f));
-		MaterialInstance->SetVectorParameterValue(
-			TEXT("SecondaryPatternOffset"),
-			FLinearColor(SecondaryPatternOffset.X, SecondaryPatternOffset.Y, SecondaryPatternOffset.Z, 0.0f));
-		const double WorldExtentMeters = FMath::Max(1.0, static_cast<double>(EffectiveCloudWorldExtentKm) * 1000.0);
-		const double WeatherAdvectionScale = 0.18;
-		const double WeatherOffsetX = FMath::Fmod(
-			UtcUnixSeconds * static_cast<double>(MeanWindEnuMetersPerSecond.X) * WeatherAdvectionScale /
-				WorldExtentMeters,
-			1.0);
-		const double WeatherOffsetY = FMath::Fmod(
-			UtcUnixSeconds * static_cast<double>(MeanWindEnuMetersPerSecond.Y) * WeatherAdvectionScale /
-				WorldExtentMeters,
-			1.0);
-		MaterialInstance->SetVectorParameterValue(
-			TEXT("WeatherMapOffset"),
-			FLinearColor(
-				static_cast<float>(WeatherOffsetX),
-				static_cast<float>(WeatherOffsetY),
-				0.0f,
-				0.0f));
-		MaterialInstance->SetVectorParameterValue(
-			TEXT("DetailNoiseTiling"),
-			FLinearColor(DetailNoiseTiling.X, DetailNoiseTiling.Y, DetailNoiseTiling.Z, 0.0f));
-	}
 }
 
 void ASkySimSystem::UpdateEnvironmentLighting()
@@ -2085,7 +1775,17 @@ void ASkySimSystem::UpdateEnvironmentLighting()
 	SkyLightComponent->SetIntensity(FMath::Max(0.0f, SkyLightIntensity));
 	if (!bHasFreshSkyState)
 	{
-		UpdatePreviewLightingFromControls();
+		if (bEditorPreviewClockInitialized)
+		{
+			UpdatePreviewLightingAtUtc(
+				EditorPreviewUtcUnixSeconds,
+				RuntimeClockLatitudeDegrees,
+				RuntimeClockLongitudeDegrees);
+		}
+		else
+		{
+			UpdatePreviewLightingFromControls();
+		}
 		return;
 	}
 
@@ -2194,7 +1894,7 @@ void ASkySimSystem::UpdatePreviewLightingFromControls()
 	{
 		return;
 	}
-	UpdatePreviewLightingAtUtc(PreviewUtcUnix);
+	UpdatePreviewLightingAtUtc(PreviewUtcUnix, ControlLatitudeDegrees, ControlLongitudeDegrees);
 }
 
 void ASkySimSystem::ResetEditorPreviewClock()
@@ -2206,56 +1906,280 @@ void ASkySimSystem::ResetEditorPreviewClock()
 		return;
 	}
 	const FDateTime UtcDateTime = ControlLocalDateTime - FTimespan::FromHours(UtcOffsetHours);
-	EditorPreviewUtcUnixSeconds = FMath::Clamp(
+	const double AuthoringUtcUnixSeconds = FMath::Clamp(
 		static_cast<double>(UtcDateTime.ToUnixTimestamp()),
 		MinimumSkyUtcUnixSeconds,
 		MaximumSkyUtcUnixSeconds);
+	const double PlatformSeconds = FPlatformTime::Seconds();
+	RuntimeClockBaseUtcUnixSeconds = AuthoringUtcUnixSeconds;
+	RuntimeClockBasePlatformSeconds = PlatformSeconds;
+	RuntimeClockTimeScale = FMath::Clamp(ControlTimeScale, -86400.0f, 86400.0f);
+	RuntimeClockLatitudeDegrees = ControlLatitudeDegrees;
+	RuntimeClockLongitudeDegrees = ControlLongitudeDegrees;
+	bRuntimeClockHasServerReference = false;
+	EditorPreviewUtcUnixSeconds = AuthoringUtcUnixSeconds;
 	EditorPreviewLocalDateTime = ControlLocalDateTime;
+	CurrentUtcDateTime = UtcDateTime;
+	CurrentLocalDateTime = ControlLocalDateTime;
+	CurrentEffectiveTimeScale = RuntimeClockTimeScale;
+	RuntimeClockSource = TEXT("authoring_fallback");
+	CurrentSunElevationDegrees = 0.0f;
 	bEditorPreviewClockInitialized = true;
 }
 
-void ASkySimSystem::UpdatePreviewLightingAtUtc(double PreviewUtcUnix)
+void ASkySimSystem::RebaseRuntimeClockFromServer(
+	double ServerUtcUnix,
+	float TimeScale,
+	double LatitudeDegrees,
+	double LongitudeDegrees,
+	double ReceivePlatformSeconds)
 {
-	if (SunLightComponent == nullptr || SkyLightComponent == nullptr || !bEnableEnvironmentLighting ||
-		!FMath::IsFinite(PreviewUtcUnix) || !FMath::IsFinite(ControlLatitudeDegrees) ||
-		!FMath::IsFinite(ControlLongitudeDegrees))
+	RuntimeClockBaseUtcUnixSeconds = FMath::Clamp(
+		ServerUtcUnix,
+		MinimumSkyUtcUnixSeconds,
+		MaximumSkyUtcUnixSeconds);
+	RuntimeClockBasePlatformSeconds = ReceivePlatformSeconds;
+	RuntimeClockTimeScale = FMath::Clamp(TimeScale, -86400.0f, 86400.0f);
+	RuntimeClockLatitudeDegrees = LatitudeDegrees;
+	RuntimeClockLongitudeDegrees = LongitudeDegrees;
+	bRuntimeClockHasServerReference = true;
+	EditorPreviewUtcUnixSeconds = RuntimeClockBaseUtcUnixSeconds;
+	const double WholeUtcSeconds = FMath::FloorToDouble(RuntimeClockBaseUtcUnixSeconds);
+	CurrentUtcDateTime = FDateTime::FromUnixTimestamp(static_cast<int64>(WholeUtcSeconds)) +
+		FTimespan::FromSeconds(RuntimeClockBaseUtcUnixSeconds - WholeUtcSeconds);
+	CurrentLocalDateTime = CurrentUtcDateTime + FTimespan::FromHours(UtcOffsetHours);
+	EditorPreviewLocalDateTime = CurrentLocalDateTime;
+	CurrentEffectiveTimeScale = RuntimeClockTimeScale;
+	RuntimeClockSource = TEXT("server_interpolated");
+	bEditorPreviewClockInitialized = true;
+}
+
+void ASkySimSystem::RebaseRuntimeClockTimeScale(float TimeScale)
+{
+	if (!bEditorPreviewClockInitialized)
+	{
+		ResetEditorPreviewClock();
+	}
+	if (!bEditorPreviewClockInitialized || !FMath::IsFinite(TimeScale))
 	{
 		return;
 	}
-	const FVector PreviewSunDirection = CalculateSunDirectionEnu(
-		PreviewUtcUnix, ControlLatitudeDegrees, ControlLongitudeDegrees);
-	const FVector PreviewSunDirectionWorld =
-		GetActorTransform().TransformVectorNoScale(PreviewSunDirection).GetSafeNormal();
-	if (!PreviewSunDirectionWorld.IsNearlyZero())
+
+	const double PlatformSeconds = FPlatformTime::Seconds();
+	bool bAdvance = true;
+	if (GetWorld() != nullptr && GetWorld()->WorldType == EWorldType::Editor)
 	{
-		SunLightComponent->SetWorldRotation((-PreviewSunDirectionWorld).Rotation());
+		const bool bHasFreshSkyState = bHasSkyState && LastSkyStateReceivePlatformSeconds >= 0.0 &&
+			PlatformSeconds - LastSkyStateReceivePlatformSeconds <= 2.0;
+		bAdvance = bPreviewInEditor && (bAnimateTimeInEditor || bHasFreshSkyState);
+	}
+	RuntimeClockBaseUtcUnixSeconds = EvaluateRuntimeClockUtc(PlatformSeconds, bAdvance);
+	RuntimeClockBasePlatformSeconds = PlatformSeconds;
+	RuntimeClockTimeScale = FMath::Clamp(TimeScale, -86400.0f, 86400.0f);
+	EditorPreviewUtcUnixSeconds = RuntimeClockBaseUtcUnixSeconds;
+}
+
+double ASkySimSystem::EvaluateRuntimeClockUtc(double PlatformSeconds, bool bAdvance) const
+{
+	if (!bEditorPreviewClockInitialized || RuntimeClockBasePlatformSeconds < 0.0 || !bAdvance)
+	{
+		return FMath::Clamp(
+			RuntimeClockBaseUtcUnixSeconds,
+			MinimumSkyUtcUnixSeconds,
+			MaximumSkyUtcUnixSeconds);
+	}
+	const double ElapsedPlatformSeconds = FMath::Max(0.0, PlatformSeconds - RuntimeClockBasePlatformSeconds);
+	return FMath::Clamp(
+		RuntimeClockBaseUtcUnixSeconds + ElapsedPlatformSeconds * static_cast<double>(RuntimeClockTimeScale),
+		MinimumSkyUtcUnixSeconds,
+		MaximumSkyUtcUnixSeconds);
+}
+
+void ASkySimSystem::UpdateRuntimeClockAndLighting()
+{
+	if (!bEditorPreviewClockInitialized)
+	{
+		ResetEditorPreviewClock();
+	}
+	if (!bEditorPreviewClockInitialized)
+	{
+		return;
+	}
+
+	const bool bEditorWorld = GetWorld() != nullptr && GetWorld()->WorldType == EWorldType::Editor;
+	const double PlatformSeconds = FPlatformTime::Seconds();
+	const bool bHasFreshSkyState = bHasSkyState && LastSkyStateReceivePlatformSeconds >= 0.0 &&
+		PlatformSeconds - LastSkyStateReceivePlatformSeconds <= 2.0;
+	const bool bPreviewEnabled = !bEditorWorld || bPreviewInEditor;
+	const bool bAdvance = bPreviewEnabled && (!bEditorWorld || bAnimateTimeInEditor || bHasFreshSkyState);
+
+	EditorPreviewUtcUnixSeconds = bAdvance
+		? EvaluateRuntimeClockUtc(PlatformSeconds, true)
+		: FMath::Clamp(
+			EditorPreviewUtcUnixSeconds,
+			MinimumSkyUtcUnixSeconds,
+			MaximumSkyUtcUnixSeconds);
+	const bool bAtClockBoundary =
+		(EditorPreviewUtcUnixSeconds <= MinimumSkyUtcUnixSeconds && RuntimeClockTimeScale < 0.0f) ||
+		(EditorPreviewUtcUnixSeconds >= MaximumSkyUtcUnixSeconds && RuntimeClockTimeScale > 0.0f);
+	if (!bAdvance || bAtClockBoundary)
+	{
+		// Rebase while intentionally paused so enabling preview later does not
+		// catch up all of the wall time that elapsed while it was disabled.
+		RuntimeClockBaseUtcUnixSeconds = EditorPreviewUtcUnixSeconds;
+		RuntimeClockBasePlatformSeconds = PlatformSeconds;
+	}
+	if (bAtClockBoundary)
+	{
+		RuntimeClockTimeScale = 0.0f;
+	}
+
+	const double WholeUtcSeconds = FMath::FloorToDouble(EditorPreviewUtcUnixSeconds);
+	CurrentUtcDateTime = FDateTime::FromUnixTimestamp(static_cast<int64>(WholeUtcSeconds)) +
+		FTimespan::FromSeconds(EditorPreviewUtcUnixSeconds - WholeUtcSeconds);
+	CurrentLocalDateTime = CurrentUtcDateTime + FTimespan::FromHours(UtcOffsetHours);
+	EditorPreviewLocalDateTime = CurrentLocalDateTime;
+	CurrentEffectiveTimeScale = bAdvance ? RuntimeClockTimeScale : 0.0f;
+	if (!bPreviewEnabled || (!bAdvance && !bHasFreshSkyState))
+	{
+		RuntimeClockSource = TEXT("editor_paused");
+	}
+	else if (bHasFreshSkyState)
+	{
+		RuntimeClockSource = bAdvance ? TEXT("server_interpolated") : TEXT("server_packet");
+	}
+	else
+	{
+		RuntimeClockSource = bRuntimeClockHasServerReference
+			? TEXT("server_fallback")
+			: TEXT("authoring_fallback");
+	}
+
+	const FVector RuntimeSunDirection = UpdateSunRotationAtUtc(
+		EditorPreviewUtcUnixSeconds,
+		RuntimeClockLatitudeDegrees,
+		RuntimeClockLongitudeDegrees);
+	if (bPreviewEnabled && !bHasFreshSkyState && !RuntimeSunDirection.IsNearlyZero())
+	{
+		const float FallbackLightingBlend = bRuntimeClockHasServerReference &&
+			RuntimeClockBasePlatformSeconds >= 0.0
+			? FMath::Clamp(
+				static_cast<float>(PlatformSeconds - RuntimeClockBasePlatformSeconds - 2.0),
+				0.0f,
+				1.0f)
+			: 1.0f;
+		UpdateWeatherFog(
+			bRuntimeClockHasServerReference ? VisibilityMeters : CustomVisibilityMeters,
+			bRuntimeClockHasServerReference ? RelativeHumidity : CustomRelativeHumidity);
+		UpdatePreviewLightingAtUtc(
+			EditorPreviewUtcUnixSeconds,
+			RuntimeClockLatitudeDegrees,
+			RuntimeClockLongitudeDegrees,
+			FallbackLightingBlend);
+	}
+
+	if (bShowDebugOverlay && PlatformSeconds >= NextRuntimeClockDiagnosticPlatformSeconds)
+	{
+		NextRuntimeClockDiagnosticPlatformSeconds = PlatformSeconds + 2.0;
+		UE_LOG(
+			LogTemp,
+			Display,
+			TEXT("SkySim clock: source=%s utc=%s local=%s scale=%.3f sun_elevation_deg=%.3f"),
+			*RuntimeClockSource,
+			*CurrentUtcDateTime.ToIso8601(),
+			*CurrentLocalDateTime.ToIso8601(),
+			CurrentEffectiveTimeScale,
+			CurrentSunElevationDegrees);
+	}
+}
+
+FVector ASkySimSystem::UpdateSunRotationAtUtc(
+	double PreviewUtcUnix,
+	double LatitudeDegrees,
+	double LongitudeDegrees)
+{
+	if (!FMath::IsFinite(PreviewUtcUnix) || !FMath::IsFinite(LatitudeDegrees) ||
+		!FMath::IsFinite(LongitudeDegrees) || LatitudeDegrees < -90.0 || LatitudeDegrees > 90.0 ||
+		LongitudeDegrees < -180.0 || LongitudeDegrees > 180.0)
+	{
+		return FVector::ZeroVector;
+	}
+
+	const FVector PreviewSunDirection = CalculateSunDirectionEnu(
+		PreviewUtcUnix,
+		LatitudeDegrees,
+		LongitudeDegrees);
+	CurrentSunElevationDegrees = static_cast<float>(FMath::RadiansToDegrees(
+		FMath::Asin(FMath::Clamp(static_cast<double>(PreviewSunDirection.Z), -1.0, 1.0))));
+	if (SunLightComponent != nullptr && bEnableEnvironmentLighting)
+	{
+		const FVector PreviewSunDirectionWorld =
+			GetActorTransform().TransformVectorNoScale(PreviewSunDirection).GetSafeNormal();
+		if (!PreviewSunDirectionWorld.IsNearlyZero())
+		{
+			SunLightComponent->SetWorldRotation((-PreviewSunDirectionWorld).Rotation());
+		}
+	}
+	return PreviewSunDirection;
+}
+
+void ASkySimSystem::UpdatePreviewLightingAtUtc(
+	double PreviewUtcUnix,
+	double LatitudeDegrees,
+	double LongitudeDegrees,
+	float FallbackBlend)
+{
+	if (SunLightComponent == nullptr || SkyLightComponent == nullptr || !bEnableEnvironmentLighting ||
+		!FMath::IsFinite(PreviewUtcUnix) || !FMath::IsFinite(LatitudeDegrees) ||
+		!FMath::IsFinite(LongitudeDegrees))
+	{
+		return;
+	}
+	const FVector PreviewSunDirection = UpdateSunRotationAtUtc(
+		PreviewUtcUnix,
+		LatitudeDegrees,
+		LongitudeDegrees);
+	if (PreviewSunDirection.IsNearlyZero())
+	{
+		return;
 	}
 	const float DaylightFactor = FMath::Sqrt(FMath::Clamp(static_cast<float>(PreviewSunDirection.Z), 0.0f, 1.0f));
 	const float NightFactor = FMath::Sqrt(FMath::Clamp(static_cast<float>(-PreviewSunDirection.Z), 0.0f, 1.0f));
-	const bool bMoonIsPrimaryForwardLight = bEnableMoonLight && NightFactor > DaylightFactor;
+	const float BlendAlpha = bRuntimeClockHasServerReference
+		? FMath::Clamp(FallbackBlend, 0.0f, 1.0f)
+		: 1.0f;
+	const float PreviewSunIlluminanceLux =
+		FMath::Max(0.0f, DefaultSunIlluminanceLux) * DaylightFactor;
+	const float BlendedSunIlluminanceLux = FMath::Lerp(
+		FMath::Max(0.0f, SunIlluminanceLux),
+		PreviewSunIlluminanceLux,
+		BlendAlpha);
+	const float PreviewMoonIlluminanceLux = FMath::Max(0.0f, DefaultMoonIlluminanceLux) * NightFactor;
+	const float BlendedMoonIlluminanceLux = FMath::Lerp(
+		FMath::Max(0.0f, MoonIlluminanceLux),
+		PreviewMoonIlluminanceLux,
+		BlendAlpha);
+	const float EffectiveSunIlluminance =
+		BlendedSunIlluminanceLux * FMath::Max(0.0f, SunIlluminanceMultiplier);
+	const float EffectiveMoonIlluminance =
+		BlendedMoonIlluminanceLux * FMath::Max(0.0f, MoonIlluminanceMultiplier);
+	const bool bMoonIsPrimaryForwardLight = bEnableMoonLight &&
+		EffectiveMoonIlluminance > EffectiveSunIlluminance;
 	SunLightComponent->ForwardShadingPriority = bMoonIsPrimaryForwardLight ? 0 : 1;
 	if (MoonLightComponent != nullptr)
 	{
 		MoonLightComponent->ForwardShadingPriority = bMoonIsPrimaryForwardLight ? 1 : 0;
 	}
-	SunLightComponent->SetIntensity(
-		FMath::Max(0.0f, DefaultSunIlluminanceLux) * FMath::Max(0.0f, SunIlluminanceMultiplier) * DaylightFactor);
+	SunLightComponent->SetIntensity(EffectiveSunIlluminance);
 	SunLightComponent->SetLightColor(SunTint);
 	SunLightComponent->SetVolumetricScatteringIntensity(FMath::Max(0.0f, SunVolumetricScatteringIntensity));
 	SkyLightComponent->SetIntensity(FMath::Max(0.0f, SkyLightIntensity));
-	// Offline editor fallback keeps a useful night preview without pretending to
-	// reproduce the server's lunar ephemeris. Live SKS1 always replaces this.
-	UpdateMoonLighting(-PreviewSunDirection, FMath::Max(0.0f, DefaultMoonIlluminanceLux) * NightFactor);
-}
-
-void ASkySimSystem::PruneStaleVolumeFrames()
-{
-	const double Now = FPlatformTime::Seconds();
-	for (auto Iterator = VolumeFrames.CreateIterator(); Iterator; ++Iterator)
+	// Cross-fade away from the last live lunar state instead of popping to the
+	// lightweight offline approximation at the two-second freshness boundary.
+	FVector PreviewMoonDirection = -PreviewSunDirection;
+	if (bRuntimeClockHasServerReference && !MoonDirectionEnu.IsNearlyZero() && BlendAlpha < 1.0f)
 	{
-		if (Now - Iterator.Value().LastReceivedPlatformSeconds > 1.0)
-		{
-			Iterator.RemoveCurrent();
-		}
+		PreviewMoonDirection = FMath::Lerp(MoonDirectionEnu, PreviewMoonDirection, BlendAlpha).GetSafeNormal();
 	}
+	UpdateMoonLighting(PreviewMoonDirection, BlendedMoonIlluminanceLux);
 }

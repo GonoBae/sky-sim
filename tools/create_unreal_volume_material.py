@@ -17,6 +17,7 @@ ASSET_NAME = "M_SkySimVolume"
 ASSET_PATH = f"{ASSET_DIRECTORY}/{ASSET_NAME}"
 DEFAULT_VOLUME_TEXTURE = "/Engine/EngineResources/DefaultVolumeTexture"
 EROSION_VOLUME_TEXTURE = "/Engine/EngineSky/VolumetricClouds/T_VolumeNoiseErosion32"
+GENERATED_VERSION = "15"
 
 
 def _enum_member(enum_type, *candidate_names):
@@ -156,6 +157,53 @@ def _load_or_create_material():
         raise RuntimeError(f"Unable to create {ASSET_PATH}")
     unreal.log(f"SkySim: created material {ASSET_PATH}")
     return material
+
+
+def _create_xy_offset(material, parameter_name, x, y):
+    parameter = _create_expression(
+        material, unreal.MaterialExpressionVectorParameter, x, y
+    )
+    _set_editor_property(parameter, "parameter_name", unreal.Name(parameter_name))
+    _set_editor_property(
+        parameter, "default_value", unreal.LinearColor(0.0, 0.0, 0.0, 0.0)
+    )
+    xy = _create_expression(
+        material, unreal.MaterialExpressionComponentMask, x + 180, y
+    )
+    for channel in ("r", "g", "b", "a"):
+        _set_editor_property(xy, channel, channel in ("r", "g"))
+    _connect(parameter, "RGB", xy, "Input")
+    return xy
+
+
+def _create_offset_coordinates(material, base_xy, offset_xy, density_z, x, y):
+    horizontal = _create_expression(
+        material, unreal.MaterialExpressionAdd, x, y
+    )
+    coordinates = _create_expression(
+        material, unreal.MaterialExpressionAppendVector, x + 180, y
+    )
+    _connect(base_xy, "", horizontal, "A")
+    _connect(offset_xy, "", horizontal, "B")
+    _connect(horizontal, "", coordinates, "A")
+    _connect(density_z, "", coordinates, "B")
+    return coordinates
+
+
+def _create_density_sample(material, parameter_name, texture, coordinates, x, y):
+    sample = _create_expression(
+        material, unreal.MaterialExpressionTextureSampleParameterVolume, x, y
+    )
+    _set_editor_property(sample, "parameter_name", unreal.Name(parameter_name))
+    _set_editor_property(sample, "texture", texture)
+    _set_editor_property(
+        sample,
+        "mip_value_mode",
+        _enum_member(unreal.TextureMipValueMode, "TMVM_MIP_LEVEL", "MIP_LEVEL"),
+    )
+    _set_editor_property(sample, "const_mip_value", 0)
+    _connect(coordinates, "", sample, "Coordinates")
+    return sample
 
 
 def build_material():
@@ -413,7 +461,7 @@ def build_material():
         unreal.LinearColor(0.0, 0.0, 0.0, 0.0),
     )
     weather_map_position = _create_expression(
-        material, unreal.MaterialExpressionAdd, 220, 300
+        material, unreal.MaterialExpressionAdd, 440, 300
     )
     macro_variation_tiling = _create_expression(
         material, unreal.MaterialExpressionVectorParameter, 220, 420
@@ -429,7 +477,7 @@ def build_material():
         unreal.LinearColor(2.15, 1.65, 0.70, 0.0),
     )
     macro_noise_coordinates = _create_expression(
-        material, unreal.MaterialExpressionMultiply, 440, 300
+        material, unreal.MaterialExpressionMultiply, 220, 300
     )
     macro_noise = _create_expression(
         material, unreal.MaterialExpressionTextureSampleParameterVolume, 660, 300
@@ -599,6 +647,63 @@ def build_material():
         material, unreal.MaterialExpressionLinearInterpolate, 2640, 420
     )
 
+    current_density_offset_xy = _create_xy_offset(
+        material, "CurrentDensityOffset", 1540, -740
+    )
+    previous_density_offset_xy = _create_xy_offset(
+        material, "PreviousDensityOffset", 1540, -880
+    )
+    secondary_motion_offset_xy = _create_xy_offset(
+        material, "SecondaryMotionOffset", 1540, 900
+    )
+    moving_secondary_coordinates = _create_expression(
+        material, unreal.MaterialExpressionAdd, 2200, 700
+    )
+    _connect(secondary_horizontal_coordinates, "", moving_secondary_coordinates, "A")
+    _connect(secondary_motion_offset_xy, "", moving_secondary_coordinates, "B")
+
+    # Offsets are final density UVs: the secondary pattern scale must not
+    # rescale endpoint advection or its separately accumulated motion phase.
+    current_primary_xy = _create_expression(
+        material, unreal.MaterialExpressionAdd, 1760, -580
+    )
+    current_secondary_xy = _create_expression(
+        material, unreal.MaterialExpressionAdd, 2420, 700
+    )
+    _connect(warped_continuous_horizontal_coordinates, "", current_primary_xy, "A")
+    _connect(current_density_offset_xy, "", current_primary_xy, "B")
+    _connect(moving_secondary_coordinates, "", current_secondary_xy, "A")
+    _connect(current_density_offset_xy, "", current_secondary_xy, "B")
+    previous_primary_coordinates = _create_offset_coordinates(
+        material, warped_continuous_horizontal_coordinates,
+        previous_density_offset_xy, clamped_density_z, 1760, -900
+    )
+    previous_secondary_coordinates = _create_offset_coordinates(
+        material, moving_secondary_coordinates,
+        previous_density_offset_xy, clamped_density_z, 2420, 920
+    )
+    previous_density_volume = _create_density_sample(
+        material, "DensityVolumePrevious", default_texture,
+        previous_primary_coordinates, 2200, -900
+    )
+    previous_secondary_density_volume = _create_density_sample(
+        material, "DensityVolumeSecondaryPrevious", default_texture,
+        previous_secondary_coordinates, 2860, 920
+    )
+    previous_blended_density = _create_expression(
+        material, unreal.MaterialExpressionLinearInterpolate, 3080, 700
+    )
+    density_frame_blend = _create_expression(
+        material, unreal.MaterialExpressionScalarParameter, 3080, 1000
+    )
+    _set_editor_property(
+        density_frame_blend, "parameter_name", unreal.Name("DensityFrameBlend")
+    )
+    _set_editor_property(density_frame_blend, "default_value", 1.0)
+    temporal_density = _create_expression(
+        material, unreal.MaterialExpressionLinearInterpolate, 3300, 420
+    )
+
     _connect(continuous_volume_coordinates, "", scaled_detail_noise_coordinates, "A")
     _connect(detail_noise_tiling, "RGB", scaled_detail_noise_coordinates, "B")
     _connect(scaled_detail_noise_coordinates, "", detail_noise_coordinates, "A")
@@ -607,11 +712,12 @@ def build_material():
     _connect(detail_noise, "R", inverse_detail_noise, "Input")
     _connect(inverse_detail_noise, "", detail_erosion, "A")
     _connect(detail_erosion_strength, "", detail_erosion, "B")
-    _connect(normalized_local_position, "", weather_map_position, "A")
-    _connect(weather_map_offset, "RGB", weather_map_position, "B")
-    _connect(weather_map_position, "", macro_noise_coordinates, "A")
+    # WeatherMapOffset is a phase in noise space, just like DetailPhaseOffset.
+    _connect(normalized_local_position, "", macro_noise_coordinates, "A")
     _connect(macro_variation_tiling, "RGB", macro_noise_coordinates, "B")
-    _connect(macro_noise_coordinates, "", macro_noise, "Coordinates")
+    _connect(macro_noise_coordinates, "", weather_map_position, "A")
+    _connect(weather_map_offset, "RGB", weather_map_position, "B")
+    _connect(weather_map_position, "", macro_noise, "Coordinates")
     _connect(macro_noise, "RGB", macro_noise_rg, "Input")
     _connect(macro_noise_rg, "", signed_macro_noise, "A")
     _connect(half_vector, "", signed_macro_noise, "B")
@@ -634,7 +740,7 @@ def build_material():
     # jumping between clamped edge texels after a Frac operation. Only Z is
     # explicitly restricted to the first/last texel centres.
     _connect(
-        warped_continuous_horizontal_coordinates,
+        current_primary_xy,
         "",
         tiled_volume_coordinates,
         "A",
@@ -667,7 +773,7 @@ def build_material():
         secondary_horizontal_coordinates,
         "B",
     )
-    _connect(secondary_horizontal_coordinates, "", secondary_volume_coordinates, "A")
+    _connect(current_secondary_xy, "", secondary_volume_coordinates, "A")
     _connect(clamped_density_z, "", secondary_volume_coordinates, "B")
     _connect(secondary_volume_coordinates, "", secondary_density_volume, "Coordinates")
     _connect(macro_noise, "G", secondary_pattern_blend, "A")
@@ -680,12 +786,18 @@ def build_material():
     _connect(density_volume, "R", blended_density, "A")
     _connect(secondary_density_volume, "R", blended_density, "B")
     _connect(secondary_pattern_blend, "", blended_density, "Alpha")
+    _connect(previous_density_volume, "R", previous_blended_density, "A")
+    _connect(previous_secondary_density_volume, "R", previous_blended_density, "B")
+    _connect(secondary_pattern_blend, "", previous_blended_density, "Alpha")
+    _connect(previous_blended_density, "", temporal_density, "A")
+    _connect(blended_density, "", temporal_density, "B")
+    _connect(density_frame_blend, "", temporal_density, "Alpha")
     _connect(macro_noise, "R", inverse_macro_noise, "Input")
     _connect(inverse_macro_noise, "", macro_erosion, "A")
     _connect(macro_variation_strength, "", macro_erosion, "B")
     _connect(detail_erosion, "", combined_erosion, "A")
     _connect(macro_erosion, "", combined_erosion, "B")
-    _connect(blended_density, "", detailed_density, "A")
+    _connect(temporal_density, "", detailed_density, "A")
     _connect(combined_erosion, "", detailed_density, "B")
     _connect(detailed_density, "", shaped_density, "Input")
 
@@ -776,6 +888,9 @@ def build_material():
 
     unreal.MaterialEditingLibrary.layout_material_expressions(material)
     unreal.MaterialEditingLibrary.recompile_material(material)
+    unreal.EditorAssetLibrary.set_metadata_tag(
+        material, unreal.Name("SkySimGeneratedVersion"), GENERATED_VERSION
+    )
     if not unreal.EditorAssetLibrary.save_loaded_asset(
         material, only_if_is_dirty=False
     ):
@@ -783,7 +898,7 @@ def build_material():
 
     unreal.log(
         "SkySim: generated /Game/SkySim/M_SkySimVolume "
-        "(cluster weather map, dual-sample de-tiling, mip-safe detail, clamped density Z)"
+        "(temporal density interpolation, de-tiling, mip-safe detail, clamped density Z)"
     )
     return material
 

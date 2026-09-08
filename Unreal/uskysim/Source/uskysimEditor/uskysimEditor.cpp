@@ -8,9 +8,9 @@
 #include "Materials/Material.h"
 #include "Materials/MaterialExpressionAdd.h"
 #include "Materials/MaterialExpressionAppendVector.h"
+#include "Materials/MaterialExpressionClamp.h"
 #include "Materials/MaterialExpressionComponentMask.h"
 #include "Materials/MaterialExpressionConstant2Vector.h"
-#include "Materials/MaterialExpressionFrac.h"
 #include "Materials/MaterialExpressionLinearInterpolate.h"
 #include "Materials/MaterialExpressionMultiply.h"
 #include "Materials/MaterialExpressionOneMinus.h"
@@ -35,10 +35,44 @@ namespace
 		return Cast<T>(UMaterialEditingLibrary::CreateMaterialExpression(Material, T::StaticClass(), X, Y));
 	}
 
+	UMaterialExpressionComponentMask* AddXYOffset(UMaterial* Material, const TCHAR* Name, int32 X, int32 Y)
+	{
+		UMaterialExpressionVectorParameter* Parameter = AddExpression<UMaterialExpressionVectorParameter>(Material, X, Y);
+		UMaterialExpressionComponentMask* XY = AddExpression<UMaterialExpressionComponentMask>(Material, X + 180, Y);
+		if (Parameter == nullptr || XY == nullptr)
+		{
+			return nullptr;
+		}
+		Parameter->ParameterName = Name;
+		Parameter->DefaultValue = FLinearColor(0.0f, 0.0f, 0.0f, 0.0f);
+		XY->R = true;
+		XY->G = true;
+		XY->B = false;
+		XY->A = false;
+		XY->Input.Connect(0, Parameter);
+		return XY;
+	}
+
+	UMaterialExpressionAppendVector* AddOffsetCoordinates(UMaterial* Material, UMaterialExpression* BaseXY,
+		UMaterialExpression* OffsetXY, UMaterialExpression* DensityZ, int32 X, int32 Y)
+	{
+		UMaterialExpressionAdd* Horizontal = AddExpression<UMaterialExpressionAdd>(Material, X, Y);
+		UMaterialExpressionAppendVector* Coordinates = AddExpression<UMaterialExpressionAppendVector>(Material, X + 180, Y);
+		if (BaseXY == nullptr || OffsetXY == nullptr || DensityZ == nullptr || Horizontal == nullptr || Coordinates == nullptr)
+		{
+			return nullptr;
+		}
+		Horizontal->A.Connect(0, BaseXY);
+		Horizontal->B.Connect(0, OffsetXY);
+		Coordinates->A.Connect(0, Horizontal);
+		Coordinates->B.Connect(0, DensityZ);
+		return Coordinates;
+	}
+
 	void CreateSkySimVolumeMaterial()
 	{
 		static const TCHAR* GeneratedVersionKey = TEXT("SkySimGeneratedVersion");
-		static const TCHAR* GeneratedVersion = TEXT("14");
+		static const TCHAR* GeneratedVersion = TEXT("15");
 		UMaterial* Material = LoadObject<UMaterial>(nullptr, SkySimVolumeMaterialPath);
 		if (Material != nullptr && FString(Material->GetOutermost()->GetMetaData().GetValue(Material, GeneratedVersionKey)) == GeneratedVersion)
 		{
@@ -63,6 +97,7 @@ namespace
 
 		Material->MaterialDomain = MD_Volume;
 		Material->BlendMode = BLEND_Additive;
+		Material->bUseMaterialAttributes = false;
 		Material->bUsedWithHeterogeneousVolumes = true;
 		UMaterialEditingLibrary::DeleteAllMaterialExpressions(Material);
 
@@ -74,7 +109,11 @@ namespace
 		UMaterialExpressionComponentMask* VerticalCoordinate = AddExpression<UMaterialExpressionComponentMask>(Material, -560, -240);
 		UMaterialExpressionScalarParameter* HorizontalTileCount = AddExpression<UMaterialExpressionScalarParameter>(Material, -560, -500);
 		UMaterialExpressionMultiply* ContinuousHorizontalCoordinates = AddExpression<UMaterialExpressionMultiply>(Material, -320, -400);
-		UMaterialExpressionFrac* RepeatedHorizontalCoordinates = AddExpression<UMaterialExpressionFrac>(Material, -100, -420);
+		UMaterialExpressionVectorParameter* InvDensityTextureResolution = AddExpression<UMaterialExpressionVectorParameter>(Material, -320, -620);
+		UMaterialExpressionComponentMask* InvDensityTextureResolutionZ = AddExpression<UMaterialExpressionComponentMask>(Material, -100, -620);
+		UMaterialExpressionMultiply* HalfDensityTexelZ = AddExpression<UMaterialExpressionMultiply>(Material, 120, -620);
+		UMaterialExpressionOneMinus* MaximumDensityZ = AddExpression<UMaterialExpressionOneMinus>(Material, 340, -620);
+		UMaterialExpressionClamp* ClampedDensityZ = AddExpression<UMaterialExpressionClamp>(Material, 560, -580);
 		UMaterialExpressionAppendVector* TiledVolumeCoordinates = AddExpression<UMaterialExpressionAppendVector>(Material, 120, -360);
 		UMaterialExpressionAppendVector* ContinuousVolumeCoordinates = AddExpression<UMaterialExpressionAppendVector>(Material, -100, -220);
 		UMaterialExpressionTextureSampleParameterVolume* DensitySample = AddExpression<UMaterialExpressionTextureSampleParameterVolume>(Material, 360, -320);
@@ -118,15 +157,33 @@ namespace
 		UMaterialExpressionScalarParameter* SecondaryPatternBlendStrength = AddExpression<UMaterialExpressionScalarParameter>(Material, 1680, 760);
 		UMaterialExpressionMultiply* SecondaryPatternBlend = AddExpression<UMaterialExpressionMultiply>(Material, 1900, 760);
 		UMaterialExpressionLinearInterpolate* BlendedDensity = AddExpression<UMaterialExpressionLinearInterpolate>(Material, 2560, 420);
+		UMaterialExpressionComponentMask* CurrentDensityOffsetXY = AddXYOffset(Material, TEXT("CurrentDensityOffset"), 1460, -740);
+		UMaterialExpressionComponentMask* PreviousDensityOffsetXY = AddXYOffset(Material, TEXT("PreviousDensityOffset"), 1460, -880);
+		UMaterialExpressionComponentMask* SecondaryMotionOffsetXY = AddXYOffset(Material, TEXT("SecondaryMotionOffset"), 1460, 900);
+		UMaterialExpressionAdd* MovingSecondaryCoordinates = AddExpression<UMaterialExpressionAdd>(Material, 2120, 700);
+		UMaterialExpressionAdd* CurrentPrimaryXY = AddExpression<UMaterialExpressionAdd>(Material, 1680, -580);
+		UMaterialExpressionAdd* CurrentSecondaryXY = AddExpression<UMaterialExpressionAdd>(Material, 2340, 700);
+		UMaterialExpressionAppendVector* PreviousPrimaryCoordinates = AddOffsetCoordinates(Material,
+			WarpedContinuousHorizontalCoordinates, PreviousDensityOffsetXY, ClampedDensityZ, 1680, -900);
+		UMaterialExpressionAppendVector* PreviousSecondaryCoordinates = AddOffsetCoordinates(Material,
+			MovingSecondaryCoordinates, PreviousDensityOffsetXY, ClampedDensityZ, 2340, 920);
+		UMaterialExpressionTextureSampleParameterVolume* PreviousDensitySample = AddExpression<UMaterialExpressionTextureSampleParameterVolume>(Material, 2120, -900);
+		UMaterialExpressionTextureSampleParameterVolume* PreviousSecondaryDensitySample = AddExpression<UMaterialExpressionTextureSampleParameterVolume>(Material, 2780, 920);
+		UMaterialExpressionLinearInterpolate* PreviousBlendedDensity = AddExpression<UMaterialExpressionLinearInterpolate>(Material, 3000, 700);
+		UMaterialExpressionScalarParameter* DensityFrameBlend = AddExpression<UMaterialExpressionScalarParameter>(Material, 3000, 1000);
+		UMaterialExpressionLinearInterpolate* TemporalDensity = AddExpression<UMaterialExpressionLinearInterpolate>(Material, 3220, 420);
 		UMaterialExpressionScalarParameter* ExtinctionScale = AddExpression<UMaterialExpressionScalarParameter>(Material, 1580, -440);
 		UMaterialExpressionMultiply* Extinction = AddExpression<UMaterialExpressionMultiply>(Material, 1800, -260);
 		UMaterialExpressionVectorParameter* Albedo = AddExpression<UMaterialExpressionVectorParameter>(Material, 1800, -60);
 		UMaterialExpressionScalarParameter* EmissionScale = AddExpression<UMaterialExpressionScalarParameter>(Material, 1580, 100);
 		UMaterialExpressionMultiply* Emission = AddExpression<UMaterialExpressionMultiply>(Material, 1800, 100);
+		UMaterialExpressionVectorParameter* EmissionColor = AddExpression<UMaterialExpressionVectorParameter>(Material, 1580, 260);
+		UMaterialExpressionMultiply* ColoredEmission = AddExpression<UMaterialExpressionMultiply>(Material, 2020, 100);
 
 		if (WorldPosition == nullptr || LocalPosition == nullptr || InvResolution == nullptr || VolumeCoordinates == nullptr ||
 			HorizontalCoordinates == nullptr || VerticalCoordinate == nullptr || HorizontalTileCount == nullptr ||
-			ContinuousHorizontalCoordinates == nullptr || RepeatedHorizontalCoordinates == nullptr ||
+			ContinuousHorizontalCoordinates == nullptr || InvDensityTextureResolution == nullptr ||
+			InvDensityTextureResolutionZ == nullptr || HalfDensityTexelZ == nullptr || MaximumDensityZ == nullptr || ClampedDensityZ == nullptr ||
 			TiledVolumeCoordinates == nullptr || ContinuousVolumeCoordinates == nullptr || DensitySample == nullptr ||
 			DensityValueScale == nullptr || ScaledDensity == nullptr || DensityValueBias == nullptr || PhysicalDensity == nullptr ||
 			DetailNoiseTiling == nullptr || DetailPhaseOffset == nullptr || EffectiveDetailTiling == nullptr ||
@@ -142,6 +199,11 @@ namespace
 			SecondaryScaledHorizontalCoordinates == nullptr || SecondaryHorizontalCoordinates == nullptr ||
 			SecondaryVolumeCoordinates == nullptr || SecondaryDensitySample == nullptr ||
 			SecondaryPatternBlendStrength == nullptr || SecondaryPatternBlend == nullptr || BlendedDensity == nullptr ||
+			CurrentDensityOffsetXY == nullptr || PreviousDensityOffsetXY == nullptr || SecondaryMotionOffsetXY == nullptr ||
+			MovingSecondaryCoordinates == nullptr || CurrentPrimaryXY == nullptr || CurrentSecondaryXY == nullptr ||
+			PreviousPrimaryCoordinates == nullptr || PreviousSecondaryCoordinates == nullptr ||
+			PreviousDensitySample == nullptr || PreviousSecondaryDensitySample == nullptr || PreviousBlendedDensity == nullptr ||
+			DensityFrameBlend == nullptr || TemporalDensity == nullptr || EmissionColor == nullptr || ColoredEmission == nullptr ||
 			ExtinctionScale == nullptr ||
 			Extinction == nullptr || Albedo == nullptr || EmissionScale == nullptr || Emission == nullptr)
 		{
@@ -163,6 +225,13 @@ namespace
 		VerticalCoordinate->A = false;
 		HorizontalTileCount->ParameterName = TEXT("HorizontalTileCount");
 		HorizontalTileCount->DefaultValue = 1.0f;
+		InvDensityTextureResolution->ParameterName = TEXT("InvDensityTextureResolution");
+		InvDensityTextureResolution->DefaultValue = FLinearColor(1.0f / 64.0f, 1.0f / 64.0f, 1.0f / 64.0f, 0.0f);
+		InvDensityTextureResolutionZ->R = false;
+		InvDensityTextureResolutionZ->G = false;
+		InvDensityTextureResolutionZ->B = true;
+		InvDensityTextureResolutionZ->A = false;
+		HalfDensityTexelZ->ConstB = 0.5f;
 		DensitySample->ParameterName = TEXT("DensityVolume");
 		DensitySample->SamplerType = SAMPLERTYPE_Color;
 		DensitySample->MipValueMode = TMVM_MipLevel;
@@ -230,6 +299,18 @@ namespace
 		SecondaryDensitySample->MipValueMode = TMVM_MipLevel;
 		SecondaryDensitySample->ConstMipValue = 0;
 		SecondaryDensitySample->Texture = DensitySample->Texture;
+		PreviousDensitySample->ParameterName = TEXT("DensityVolumePrevious");
+		PreviousDensitySample->SamplerType = SAMPLERTYPE_Color;
+		PreviousDensitySample->MipValueMode = TMVM_MipLevel;
+		PreviousDensitySample->ConstMipValue = 0;
+		PreviousDensitySample->Texture = DensitySample->Texture;
+		PreviousSecondaryDensitySample->ParameterName = TEXT("DensityVolumeSecondaryPrevious");
+		PreviousSecondaryDensitySample->SamplerType = SAMPLERTYPE_Color;
+		PreviousSecondaryDensitySample->MipValueMode = TMVM_MipLevel;
+		PreviousSecondaryDensitySample->ConstMipValue = 0;
+		PreviousSecondaryDensitySample->Texture = DensitySample->Texture;
+		DensityFrameBlend->ParameterName = TEXT("DensityFrameBlend");
+		DensityFrameBlend->DefaultValue = 1.0f;
 		SecondaryPatternBlendStrength->ParameterName = TEXT("SecondaryPatternBlendStrength");
 		SecondaryPatternBlendStrength->DefaultValue = 0.72f;
 		ExtinctionScale->ParameterName = TEXT("ExtinctionScale");
@@ -238,6 +319,8 @@ namespace
 		Albedo->DefaultValue = FLinearColor(0.98f, 0.98f, 0.98f, 1.0f);
 		EmissionScale->ParameterName = TEXT("DebugEmissionScale");
 		EmissionScale->DefaultValue = 0.0f;
+		EmissionColor->ParameterName = TEXT("EmissionColor");
+		EmissionColor->DefaultValue = FLinearColor::White;
 
 		LocalPosition->Input.Connect(0, WorldPosition);
 		VolumeCoordinates->A.Connect(0, LocalPosition);
@@ -246,9 +329,17 @@ namespace
 		VerticalCoordinate->Input.Connect(0, VolumeCoordinates);
 		ContinuousHorizontalCoordinates->A.Connect(0, HorizontalCoordinates);
 		ContinuousHorizontalCoordinates->B.Connect(0, HorizontalTileCount);
-		RepeatedHorizontalCoordinates->Input.Connect(0, ContinuousHorizontalCoordinates);
-		TiledVolumeCoordinates->A.Connect(0, WarpedContinuousHorizontalCoordinates);
-		TiledVolumeCoordinates->B.Connect(0, VerticalCoordinate);
+		InvDensityTextureResolutionZ->Input.Connect(0, InvDensityTextureResolution);
+		HalfDensityTexelZ->A.Connect(0, InvDensityTextureResolutionZ);
+		MaximumDensityZ->Input.Connect(0, HalfDensityTexelZ);
+		ClampedDensityZ->Input.Connect(0, VerticalCoordinate);
+		ClampedDensityZ->Min.Connect(0, HalfDensityTexelZ);
+		ClampedDensityZ->Max.Connect(0, MaximumDensityZ);
+		// Keep XY continuous for texture wrap filtering, and constrain only Z.
+		CurrentPrimaryXY->A.Connect(0, WarpedContinuousHorizontalCoordinates);
+		CurrentPrimaryXY->B.Connect(0, CurrentDensityOffsetXY);
+		TiledVolumeCoordinates->A.Connect(0, CurrentPrimaryXY);
+		TiledVolumeCoordinates->B.Connect(0, ClampedDensityZ);
 		ContinuousVolumeCoordinates->A.Connect(0, ContinuousHorizontalCoordinates);
 		ContinuousVolumeCoordinates->B.Connect(0, VerticalCoordinate);
 		DensitySample->Coordinates.Connect(0, TiledVolumeCoordinates);
@@ -260,11 +351,12 @@ namespace
 		InverseDetailNoise->Input.Connect(1, DetailNoiseSample);
 		DetailErosion->A.Connect(0, InverseDetailNoise);
 		DetailErosion->B.Connect(0, DetailErosionStrength);
-		WeatherMapPosition->A.Connect(0, VolumeCoordinates);
-		WeatherMapPosition->B.Connect(0, WeatherMapOffset);
-		MacroNoiseCoordinates->A.Connect(0, WeatherMapPosition);
+		// Both weather and detail phase offsets are applied after noise tiling.
+		MacroNoiseCoordinates->A.Connect(0, VolumeCoordinates);
 		MacroNoiseCoordinates->B.Connect(0, MacroVariationTiling);
-		MacroNoiseSample->Coordinates.Connect(0, MacroNoiseCoordinates);
+		WeatherMapPosition->A.Connect(0, MacroNoiseCoordinates);
+		WeatherMapPosition->B.Connect(0, WeatherMapOffset);
+		MacroNoiseSample->Coordinates.Connect(0, WeatherMapPosition);
 		MacroNoiseRG->Input.Connect(0, MacroNoiseSample);
 		SignedMacroNoise->A.Connect(0, MacroNoiseRG);
 		SignedMacroNoise->B.Connect(0, HalfVector);
@@ -283,17 +375,30 @@ namespace
 		SecondaryScaledHorizontalCoordinates->B.Connect(0, SecondaryPatternScaleXY);
 		SecondaryHorizontalCoordinates->A.Connect(0, SecondaryScaledHorizontalCoordinates);
 		SecondaryHorizontalCoordinates->B.Connect(0, SecondaryPatternOffsetXY);
-		SecondaryVolumeCoordinates->A.Connect(0, SecondaryHorizontalCoordinates);
-		SecondaryVolumeCoordinates->B.Connect(0, VerticalCoordinate);
+		// Endpoint offsets are density UVs, not inputs to SecondaryPatternScale.
+		MovingSecondaryCoordinates->A.Connect(0, SecondaryHorizontalCoordinates);
+		MovingSecondaryCoordinates->B.Connect(0, SecondaryMotionOffsetXY);
+		CurrentSecondaryXY->A.Connect(0, MovingSecondaryCoordinates);
+		CurrentSecondaryXY->B.Connect(0, CurrentDensityOffsetXY);
+		SecondaryVolumeCoordinates->A.Connect(0, CurrentSecondaryXY);
+		SecondaryVolumeCoordinates->B.Connect(0, ClampedDensityZ);
 		SecondaryDensitySample->Coordinates.Connect(0, SecondaryVolumeCoordinates);
+		PreviousDensitySample->Coordinates.Connect(0, PreviousPrimaryCoordinates);
+		PreviousSecondaryDensitySample->Coordinates.Connect(0, PreviousSecondaryCoordinates);
 		SecondaryPatternBlend->A.Connect(2, MacroNoiseSample);
 		SecondaryPatternBlend->B.Connect(0, SecondaryPatternBlendStrength);
 		BlendedDensity->A.Connect(1, DensitySample);
 		BlendedDensity->B.Connect(1, SecondaryDensitySample);
 		BlendedDensity->Alpha.Connect(0, SecondaryPatternBlend);
+		PreviousBlendedDensity->A.Connect(1, PreviousDensitySample);
+		PreviousBlendedDensity->B.Connect(1, PreviousSecondaryDensitySample);
+		PreviousBlendedDensity->Alpha.Connect(0, SecondaryPatternBlend);
+		TemporalDensity->A.Connect(0, PreviousBlendedDensity);
+		TemporalDensity->B.Connect(0, BlendedDensity);
+		TemporalDensity->Alpha.Connect(0, DensityFrameBlend);
 		// Broad weather-map erosion and a transformed second live-density lookup
 		// create clustered cloudy/clear regions without per-tile hard boundaries.
-		DetailedDensity->A.Connect(0, BlendedDensity);
+		DetailedDensity->A.Connect(0, TemporalDensity);
 		DetailedDensity->B.Connect(0, CombinedErosion);
 		ShapedDensity->Input.Connect(0, DetailedDensity);
 		ScaledDensity->A.Connect(0, ShapedDensity);
@@ -304,9 +409,11 @@ namespace
 		Extinction->B.Connect(0, ExtinctionScale);
 		Emission->A.Connect(0, PhysicalDensity);
 		Emission->B.Connect(0, EmissionScale);
+		ColoredEmission->A.Connect(0, Emission);
+		ColoredEmission->B.Connect(0, EmissionColor);
 		Material->GetEditorOnlyData()->SubsurfaceColor.Connect(0, Extinction);
 		Material->GetEditorOnlyData()->BaseColor.Connect(0, Albedo);
-		Material->GetEditorOnlyData()->EmissiveColor.Connect(0, Emission);
+		Material->GetEditorOnlyData()->EmissiveColor.Connect(0, ColoredEmission);
 
 		UMaterialEditingLibrary::RecompileMaterial(Material);
 		Material->MarkPackageDirty();
